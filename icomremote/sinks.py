@@ -424,12 +424,54 @@ def _numbered(path, n):
     return "%s_%d%s" % (root, n, ext)
 
 
+def _open_new_recording(path):
+    if sys.platform != "win32":
+        return open(path, "xb")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    generic_write = 0x40000000
+    share_read = 0x00000001
+    create_new = 1
+    open_reparse_point = 0x00200000
+    # The Windows CRT's exclusive open can follow a dangling symlink.
+    # CREATE_NEW with OPEN_REPARSE_POINT treats the link itself as existing.
+    handle = create_file(path, generic_write, share_read, None, create_new,
+                         open_reparse_point, None)
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+            raise FileExistsError(path)
+        raise ctypes.WinError(error)
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        close_handle(handle)
+        raise
+    try:
+        return os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _exclusive_file(path):
     """Reserve a new file atomically; existing files and symlinks are never followed."""
     for n in range(10000):
         candidate = _numbered(path, n)
         try:
-            return candidate, open(candidate, "xb")
+            return candidate, _open_new_recording(candidate)
         except FileExistsError:
             continue
     raise FileExistsError("too many recordings with this name")
