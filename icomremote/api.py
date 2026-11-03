@@ -20,6 +20,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import socket
 import socketserver
 import threading
@@ -27,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import __version__
 from .service import ApiError
+from .network import ManagedConnections
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,8 @@ def _num(body, key, kind=float):
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ApiError("bad_request", "%s must be a number" % key)
+    if not math.isfinite(v):
+        raise ApiError("bad_request", "%s must be finite" % key)
     return kind(v)
 
 
@@ -112,12 +116,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        length = int(self.headers.get("Content-Length") or 0)
+        if self.headers.get("Transfer-Encoding"):
+            raise ApiError("bad_request", "Transfer-Encoding is not supported")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError("bad_request", "invalid Content-Length") from None
+        if length < 0:
+            raise ApiError("bad_request", "Content-Length must not be negative")
         if length > MAX_BODY:
             raise ApiError("too_large", "request body too large", 413)
-        raw = self.rfile.read(length) if length else b""
         if ctype != "application/json":
             raise ApiError("unsupported_media_type", "POST bodies must be application/json", 415)
+        raw = self.rfile.read(length) if length else b""
+        if len(raw) != length:
+            raise ApiError("bad_request", "incomplete request body")
         if not raw.strip():
             return {}
         try:
@@ -130,6 +143,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         try:
+            if self.server.closing.is_set():
+                raise ApiError("unavailable", "API is disabled", 503)
             self._check_access()
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
             routes = self.server.api.routes
@@ -150,7 +165,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(e.http_status, e.code, str(e))
         except Exception as e:                     # never kill the server thread
             log.exception("api handler failed")
-            self._error(500, "internal_error", str(e))
+            self._error(500, "internal_error", "request failed; see application log")
 
     def do_GET(self):
         self._dispatch("GET")
@@ -162,7 +177,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._error(405, "method_not_allowed", "CORS is not supported")
 
 
-class _Server(ThreadingHTTPServer):
+class _Server(ManagedConnections, ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
@@ -211,6 +226,7 @@ class ApiServer:
 
     def stop(self):
         if self._httpd is not None:
+            self._httpd.close_clients()
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None

@@ -424,6 +424,128 @@ def _numbered(path, n):
     return "%s_%d%s" % (root, n, ext)
 
 
+def _exclusive_file(path):
+    """Reserve a new file atomically; existing files and symlinks are never followed."""
+    for n in range(10000):
+        candidate = _numbered(path, n)
+        try:
+            return candidate, open(candidate, "xb")
+        except FileExistsError:
+            continue
+    raise FileExistsError("too many recordings with this name")
+
+
+class BufferedFileSink:
+    """Bounded FIFO writer. Disk and encoder work never runs on the radio loop.
+
+    Accepted samples drain on close. Overflow stops recording visibly rather
+    than silently discarding audio; the already accepted prefix is finalized.
+    Long silence gaps are one small queue entry, expanded only by the writer.
+    """
+    MAX_BYTES = 4 * 1024 * 1024
+    MAX_ITEMS = 256
+
+    def __init__(self, sink, on_error=None):
+        self.sink = sink
+        self.path = sink.path
+        self._condition = threading.Condition()
+        self._queue = collections.deque()
+        self._bytes = 0
+        self._closing = False
+        self._error = None
+        self._rate = None
+        self._seconds = 0.0
+        self._on_error = on_error or (lambda error: None)
+        self._thread = threading.Thread(target=self._run, name="icom-recording", daemon=True)
+        self._thread.start()
+
+    @property
+    def current_path(self):
+        return self.sink.current_path
+
+    def _enqueue(self, item, size=0):
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("recording writer failed: %s" % self._error)
+            if self._closing:
+                raise RuntimeError("recording writer is closed")
+            if self._bytes + size > self.MAX_BYTES or len(self._queue) >= self.MAX_ITEMS:
+                self._error = BufferError("recording storage cannot keep up; recording stopped")
+                self._closing = True
+                self._condition.notify_all()
+                raise self._error
+            self._queue.append((item, size))
+            self._bytes += size
+            self._condition.notify()
+
+    def set_input_rate(self, rate):
+        rate = int(round(rate))
+        if rate <= 0:
+            raise ValueError("sample rate must be positive")
+        if rate != self._rate:
+            self._enqueue(("rate", rate))
+            self._rate = rate
+
+    def write(self, samples):
+        if self._rate is None:
+            raise RuntimeError("recording sample rate is not set")
+        samples = np.array(samples, dtype=np.int16, copy=True)
+        self._enqueue(("audio", samples), samples.nbytes)
+        self._seconds += len(samples) / self._rate
+
+    def write_silence(self, frames):
+        self._enqueue(("silence", int(frames)))
+        self._seconds += frames / self._rate
+
+    def seconds(self):
+        return self._seconds
+
+    def _run(self):
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._queue or self._closing)
+                    if not self._queue:
+                        break
+                    (kind, value), size = self._queue.popleft()
+                if kind == "rate":
+                    self.sink.set_input_rate(value)
+                elif kind == "audio":
+                    self.sink.write(value)
+                else:
+                    silence = np.zeros(48000, dtype=np.int16)
+                    while value:
+                        n = min(value, len(silence))
+                        self.sink.write(silence[:n])
+                        value -= n
+                with self._condition:
+                    self._bytes -= size
+        except Exception as exc:
+            with self._condition:
+                self._error = exc
+                self._closing = True
+                self._queue.clear()
+                self._bytes = 0
+            self._on_error(exc)
+        finally:
+            try:
+                self.sink.close()
+            except Exception as exc:
+                self._error = exc
+                self._on_error(exc)
+
+    def close(self, wait=True):
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+        if wait:
+            self._thread.join(15)
+            if self._thread.is_alive():
+                raise RuntimeError("recording storage is still blocked; finalization is pending")
+            if self._error is not None:
+                raise RuntimeError("recording stopped: %s" % self._error)
+
+
 class WavSink:
     """16-bit mono PCM at the radio's rate (48 kHz).
 
@@ -434,6 +556,7 @@ class WavSink:
     def __init__(self, path):
         self.path = path
         self._wav = None
+        self._file = None
         self._rate = None
         self._part = 0
         self.frames = 0
@@ -444,11 +567,16 @@ class WavSink:
         if self._wav is not None and rate == self._rate:
             return
         if self._wav is not None:
-            self._wav.close()
+            self.close()
             self._part += 1
         self._rate = rate
-        self.current_path = _numbered(self.path, self._part)
-        self._wav = wave.open(self.current_path, "wb")
+        self.current_path, self._file = _exclusive_file(_numbered(self.path, self._part))
+        try:
+            self._wav = wave.open(self._file, "wb")
+        except BaseException:
+            self._file.close()
+            self._file = None
+            raise
         self._wav.setnchannels(1)
         self._wav.setsampwidth(2)
         self._wav.setframerate(rate)
@@ -465,8 +593,12 @@ class WavSink:
 
     def close(self):
         if self._wav is not None:
-            self._wav.close()   # patches the RIFF header sizes
-            self._wav = None
+            try:
+                self._wav.close()   # patches the RIFF header sizes
+            finally:
+                self._wav = None
+                self._file.close()
+                self._file = None
 
 
 class M4aSink:
@@ -480,6 +612,7 @@ class M4aSink:
             raise RuntimeError("MP4/M4A recording needs PyAV: pip install av")
         self.path = path
         self._container = None
+        self._file = None
         self._stream = None
         self._resampler = None
         self._in_rate = None
@@ -497,8 +630,13 @@ class M4aSink:
             self._part += 1
         self._in_rate = rate
         self._pts = 0
-        self.current_path = _numbered(self.path, self._part)
-        self._container = av.open(self.current_path, mode="w", format="mp4")
+        self.current_path, self._file = _exclusive_file(_numbered(self.path, self._part))
+        try:
+            self._container = av.open(self._file, mode="w", format="mp4")
+        except BaseException:
+            self._file.close()
+            self._file = None
+            raise
         self._stream = self._container.add_stream("aac", rate=self.OUT_RATE)
         cc = self._stream.codec_context
         try:
@@ -534,8 +672,12 @@ class M4aSink:
             for packet in self._stream.encode(None):
                 self._container.mux(packet)
         finally:
-            self._container.close()
-            self._container = None
+            try:
+                self._container.close()
+            finally:
+                self._container = None
+                self._file.close()
+                self._file = None
 
     def close(self):
         if self._container is not None:

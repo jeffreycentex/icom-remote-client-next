@@ -38,7 +38,7 @@ def rotate_logs(path, keep=KEEP_LOGS):
         os.replace(path, path + ".1")
 
 
-def check():
+def check(verify_credentials=False):
     """Report what this build/installation can do. Exit code 0 = everything required works."""
     lines = ["Icom Remote %s, Python %s, %s %s%s" % (
         __version__, platform.python_version(), platform.system(), platform.machine(),
@@ -97,6 +97,24 @@ def check():
     item("Recording", pyav, required=False)
     item("Resampler", resampler, required=False)
     item("Protocol", protocol)
+    from .secrets import SecretStore
+    def credentials():
+        store = SecretStore()
+        backend = type(store._backend()).__module__
+        if verify_credentials:
+            from uuid import uuid4
+            identifier = "self-check-" + uuid4().hex
+            value = uuid4().hex
+            store.set(identifier, value)
+            try:
+                if store.get(identifier) != value:
+                    raise RuntimeError("Credential readback failed")
+            finally:
+                store.delete(identifier)
+            return backend + " write/read/delete passed"
+        return backend
+
+    item("Credentials", credentials, required=verify_credentials)
     lines.append("RESULT: %s" % ("OK" if ok else "FAILED"))
     text = "\n".join(lines)
     print(text)                                  # no-op in a windowed build (stdout is None)
@@ -112,10 +130,12 @@ def main():
     ap = argparse.ArgumentParser(prog="icomremote", description="Icom RS-BA1 remote client")
     ap.add_argument("--debug", action="store_true", help="verbose logging, including packet hex dumps")
     ap.add_argument("--log-file", help="also write the log to this file")
+    ap.add_argument("--check-credentials", action="store_true", help="self-check including a temporary secure-store round trip")
     ap.add_argument("--check", action="store_true", help="report bundled components and exit")
     ap.add_argument("--version", action="version", version="Icom Remote %s" % __version__)
     args, qt_args = ap.parse_known_args()
 
+    checking = args.check or args.check_credentials
     handlers = []
     if sys.stderr is not None:                 # None in a windowed Windows build
         handlers.append(logging.StreamHandler())
@@ -125,9 +145,9 @@ def main():
     for i, log_file in enumerate(log_files):
         try:
             os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
-            if i == 0 and not args.check:
+            if i == 0 and not checking:
                 rotate_logs(log_file)
-            handlers.append(logging.FileHandler(log_file, mode="a" if args.check else "w",
+            handlers.append(logging.FileHandler(log_file, mode="a" if checking else "w",
                                                 encoding="utf-8"))
         except OSError:
             pass
@@ -138,8 +158,8 @@ def main():
                                          platform.system(), platform.release(), platform.python_version(),
                                          log_files[0])
 
-    if args.check:
-        return check()
+    if checking:
+        return check(verify_credentials=args.check_credentials)
     try:
         from icomremote.gui import run
     except ImportError as e:

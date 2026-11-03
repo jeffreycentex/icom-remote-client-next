@@ -17,13 +17,16 @@ log = logging.getLogger(__name__)
 
 
 def default_dir():
+    override = os.environ.get("ICOM_REMOTE_STATE_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "IcomRemote")
+        return os.path.join(base, "IcomRemoteNext")
     if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/IcomRemote")
+        return os.path.expanduser("~/Library/Application Support/IcomRemoteNext")
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "icomremote")
+    return os.path.join(base, "icomremote-next")
 
 
 class RestoreStore:

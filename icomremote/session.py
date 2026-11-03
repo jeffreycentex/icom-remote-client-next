@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, replace
+from functools import wraps
 from typing import Optional
 
 import numpy as np
@@ -29,7 +30,7 @@ from .restore import RestoreStore
 from .state import freq_limits
 from .rsba1.stream import StreamError
 from .rsba1.streams import AudioStream, AuthError, ControlStream, SerialStream
-from .sinks import SoundCardSink, make_file_sink
+from .sinks import BufferedFileSink, SoundCardSink, make_file_sink
 from .timerres import high_resolution_timer
 
 log = logging.getLogger(__name__)
@@ -95,6 +96,31 @@ class PttRefused(RuntimeError):
     """PTT not allowed right now; the message says why."""
 
 
+def session_command(fn):
+    """Apply radio control and PTT state on the session event loop."""
+    @wraps(fn)
+    def submit(self, *args, **kwargs):
+        loop = self._loop
+        if (threading.current_thread() is self._thread or loop is None
+                or loop.is_closed() or not loop.is_running()):
+            return fn(self, *args, **kwargs)
+        future = concurrent.futures.Future()
+        def apply():
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(fn(self, *args, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+        loop.call_soon_threadsafe(apply)
+        try:
+            return future.result(5)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise NotConnected("radio control timed out") from None
+    return submit
+
+
 class RadioSession:
     def __init__(self, on_event=None, state_dir=None):
         self._on_event = on_event or (lambda kind, payload: None)
@@ -137,12 +163,8 @@ class RadioSession:
         self._pending_reads = {g: collections.deque() for g in civ.READ_GROUPS}
         self._fence = {}
         self._keying = False             # key-down requested, waiting for the DATA check
-        # PTT requests: the newest one wins. Callers set the desired state
-        # (self.ptt, owner) under the lock and bump the sequence; the loop applies
-        # a request only if it is still the newest, so a stale release can never
-        # clear a newer press (or a stale press re-key after a release).
-        self._ptt_lock = threading.RLock()
-        self._ptt_seq = 0
+        # Desired PTT, ownership, timers and actual keying belong to the session
+        # loop. Public PTT calls synchronously submit to that owner.
         # RF power and tuner
         self.rf_power = None             # 0..255 as the radio reports it
         self._rf_hold_until = 0.0        # ignore reports briefly after a change from the app
@@ -237,7 +259,11 @@ class RadioSession:
                 loop.call_soon_threadsafe(stop.set)
             except RuntimeError:
                 pass
+        if t is threading.current_thread():
+            raise RuntimeError("cannot join the session from its own event loop")
         t.join(timeout)
+        if t.is_alive():
+            raise RuntimeError("radio session did not stop; refusing a second session")
         self._thread = None
 
     def shutdown(self):
@@ -728,6 +754,30 @@ class RadioSession:
         self._loop.call_soon_threadsafe(_send)
         return new_state
 
+    @session_command
+    def control_tune(self, freq_hz=None, mode=None, data=None, filt=None):
+        """Validate and apply a complete service tuning request atomically."""
+        self._require_on()
+        if self.ptt or self.tx or self._keyed or self._keying:
+            raise PttRefused("the radio is transmitting")
+        if self._tuning or self.tuner == civ.TUNER_TUNING:
+            raise PttRefused("the antenna tuner is tuning")
+        if freq_hz is not None:
+            hz = float(freq_hz)
+            if not self.freq_limits[0] <= hz <= self.freq_limits[1]:
+                raise ValueError("frequency is outside the radio's receive range")
+        if mode is not None:
+            if mode not in civ.MODE_CODES or (filt is not None and filt not in (1, 2, 3)):
+                raise ValueError("unsupported mode or filter")
+            if (self.rig.mode, self.rig.data) != (mode, bool(data)) or filt is not None:
+                self.set_mode(mode, data, filt)
+        elif filt is not None:
+            self.set_filter(filt)
+        if freq_hz is not None:
+            self.set_frequency(freq_hz)
+        return self.rig
+
+    @session_command
     def set_frequency(self, hz):
         hz = int(round(float(hz)))
         lo, hi = self.freq_limits
@@ -737,6 +787,7 @@ class RadioSession:
         st = replace(self.rig, freq_hz=hz)
         return self._apply(st, [civ.set_freq(a, hz), civ.read_freq(a)])
 
+    @session_command
     def set_mode(self, civ_mode, data, filt=None):
         """civ_mode: LSB/USB/AM/FM; data: DATA mode on/off; filt: 1-3 or None = keep."""
         if civ_mode not in civ.MODE_CODES:
@@ -755,6 +806,7 @@ class RadioSession:
             frames.append(civ.read_if_width(a))
         return self._apply(st, frames)
 
+    @session_command
     def set_filter(self, filt):
         if not self.rig.mode:
             raise NotConnected("mode not known yet")
@@ -826,53 +878,45 @@ class RadioSession:
             return "the antenna tuner is tuning"
         return self._rule_violation(self.rig.data, self.rig.mode, voice_ok)
 
+    @session_command
     def set_ptt(self, on, owner=None, reason=None, voice_ok=False):
         """Thread-safe. Raises PttRefused when keying isn't allowed.
         voice_ok: allow transmitting in a voice mode (GUI space bar only)."""
-        with self._ptt_lock:
-            if on:
-                why = self.ptt_refusal(voice_ok)
-                if why:
-                    raise PttRefused("PTT refused: " + why)
-            elif not self.ptt:
-                return
-            self._ptt_seq += 1
-            seq = self._ptt_seq
-            self.ptt = bool(on)
-            self._ptt_owner = owner if on else None
-        loop = self._loop
-        if loop is not None and not loop.is_closed():
-            loop.call_soon_threadsafe(self._ptt_request, seq, bool(on), reason, voice_ok)
+        if on:
+            why = self.ptt_refusal(voice_ok)
+            if why:
+                raise PttRefused("PTT refused: " + why)
+            if self.ptt:
+                if self._ptt_owner is not owner:
+                    raise PttRefused("PTT is owned by another control client")
+                return  # never extend an existing transmit deadline
+        elif not self.ptt and not self._keyed and not self._keying:
+            return
+        self.ptt = bool(on)
+        self._ptt_owner = owner if on else None
+        self._ptt_apply(bool(on), reason, voice_ok)
 
+    @session_command
     def release_ptt(self, owner, reason="Unkeyed: the rigctl client that keyed PTT disconnected"):
         """Unkey if `owner` keyed (rigctld calls this when a client disconnects)."""
-        with self._ptt_lock:
-            if self.ptt and self._ptt_owner is owner:
-                self.set_ptt(False, reason=reason)
-
-    def _ptt_request(self, seq, on, reason, voice_ok):
-        with self._ptt_lock:
-            if seq != self._ptt_seq:
-                return                       # superseded by a newer request or an automatic unkey
-        self._ptt_apply(on, reason, voice_ok)
+        if self.ptt and self._ptt_owner is owner:
+            self.set_ptt(False, reason=reason)
 
     def _unkey(self, reason=None):
-        """Loop thread (or teardown): unkey now, and invalidate requests in flight."""
-        with self._ptt_lock:
-            self._ptt_seq += 1
-            self.ptt = False
-            self._ptt_owner = None
+        """Session loop (or teardown): cancel pending key-down and unkey now."""
+        self.ptt = False
+        self._ptt_owner = None
         self._ptt_apply(False, reason)
 
     def _ptt_apply(self, on, reason=None, voice_ok=False):
         """Loop thread. Key-down / unkey the radio and start/stop TX audio."""
         if on:
+            if self._keyed or self._keying:
+                return
             self._key_voice_ok = voice_ok
             if self._ptt_timer is not None:
                 self._ptt_timer.cancel()
             self._ptt_timer = self._loop.call_later(self.ptt_timeout, self._ptt_timed_out)
-            if self._keyed or self._keying:
-                return
             self._keying = True
             self._loop.create_task(self._key_after_check())
             return
@@ -880,6 +924,7 @@ class RadioSession:
             self._ptt_timer.cancel()
             self._ptt_timer = None
         self._keying = False                 # cancels a key-down still waiting for its check
+        self._emit("ptt", False)
         if not self._keyed:
             return
         self._keyed = False
@@ -891,7 +936,6 @@ class RadioSession:
         log.info("PTT off (%s, %d audio frames sent)", self._tx_kind, self._tx_frames_sent)
         self._tx_kind = None
         self._tx_src = None
-        self._emit("ptt", False)
         if reason:
             self._status(reason, "error")
 
@@ -1056,6 +1100,7 @@ class RadioSession:
         self._loop.call_soon_threadsafe(_do)
 
     # ------------------------------------------------------------------ RF power and tuner
+    @session_command
     def set_rf_power(self, percent):
         """Thread-safe: RF power 0-100 %."""
         self._require_on()
@@ -1070,6 +1115,7 @@ class RadioSession:
         self._loop.call_soon_threadsafe(_send)
         return level
 
+    @session_command
     def tune(self):
         """Thread-safe: run the internal antenna tuner's tune cycle (like the TUNER button)."""
         self._require_on()
@@ -1374,11 +1420,7 @@ class RadioSession:
         if gap < 0.5:
             return
         sink = self._sinks["file"]
-        silence = np.zeros(SAMPLE_RATE, dtype="<i2")
-        left = int(gap * SAMPLE_RATE)
-        while left > 0:
-            sink.write(silence[:min(left, SAMPLE_RATE)])
-            left -= SAMPLE_RATE
+        sink.write_silence(int(gap * SAMPLE_RATE))
         self.gap_seconds += gap
         log.info("recording: inserted %.1f s of silence for the gap without audio", gap)
 
@@ -1393,7 +1435,10 @@ class RadioSession:
         sink = self._sinks.pop(name, None)
         if sink is not None:
             try:
-                sink.close()
+                if isinstance(sink, BufferedFileSink):
+                    sink.close(wait=False)
+                else:
+                    sink.close()
             except Exception:
                 pass
         self._status(message, "error")
@@ -1402,8 +1447,9 @@ class RadioSession:
     def _install_sink(self, name, sink):
         with self._sink_lock:
             old = self._sinks.pop(name, None)
-            if old is not None:
-                old.close()
+        if old is not None:
+            old.close()  # never wait for the writer while holding the audio lock
+        with self._sink_lock:
             if sink is not None:
                 self._sinks[name] = sink
                 if self._connected:
@@ -1417,7 +1463,13 @@ class RadioSession:
 
     def start_recording(self, path):
         """Record received audio (.wav, .m4a or .mp4). Waits for audio if not connected."""
-        sink = make_file_sink(path)
+        def failed(exc):
+            loop = self._loop
+            if loop is not None and loop.is_running() and not loop.is_closed():
+                loop.call_soon_threadsafe(self._recording_failed, sink, str(exc))
+            else:
+                self._recording_failed(sink, str(exc))
+        sink = BufferedFileSink(make_file_sink(path), on_error=failed)
         with self._sink_lock:
             self._rec_last_audio, self._rec_gap_pending, self.gap_seconds = None, False, 0.0
         ok = self._install_sink("file", sink)
@@ -1425,12 +1477,22 @@ class RadioSession:
             self._emit("recording", {"active": True, "path": path})
         return ok
 
+    def _recording_failed(self, sink, error):
+        with self._sink_lock:
+            if self._sinks.get("file") is sink:
+                self._drop_sink("file", "Recording failed: " + error)
+
     def stop_recording(self):
         with self._sink_lock:
             sink = self._sinks.pop("file", None)
         if sink is None:
             return None
-        sink.close()
+        try:
+            sink.close()
+        except RuntimeError as exc:
+            self._status(str(exc), "error")
+            self._emit("sink_failed", "file")
+            raise
         info = {"active": False, "path": sink.current_path or sink.path, "seconds": sink.seconds(),
                 "gap_seconds": self.gap_seconds}
         self._emit("recording", info)

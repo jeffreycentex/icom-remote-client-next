@@ -7,17 +7,18 @@ import sys
 import time
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QSlider, QSpinBox, QStatusBar, QVBoxLayout, QWidget)
+    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QVBoxLayout, QWidget)
 
 from . import __version__, civ, quicktune
 from .api import DEFAULT_PORT as API_DEFAULT_PORT, ApiServer
 from .rigctld import RigctldServer
 from .service import ApiError, IcomService, default_record_dir
 from .session import ConnectionSpec, NotConnected, PttRefused
+from .secrets import SecretStore
 from .sinks import (HAVE_PYAV, HAVE_SOUNDDEVICE, PULSE_PREFIX, create_null_sink,
                     guess_virtual_cable, list_output_devices, sounddevice_error)
 from .state import BASE_MODES, FILTERS, PROFILES
@@ -31,6 +32,28 @@ SWR_YELLOW = 1.5
 SWR_RED = 2.5
 
 
+def apply_light_theme(app):
+    """Keep controls readable even when the desktop uses a dark appearance."""
+    app.setStyle("Fusion")
+    if hasattr(app.styleHints(), "setColorScheme"):
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    palette = QPalette()
+    for role, color in (
+        (QPalette.Window, "#f6f7f9"), (QPalette.WindowText, "#172334"),
+        (QPalette.Base, "#ffffff"), (QPalette.AlternateBase, "#eef2f7"),
+        (QPalette.Text, "#172334"), (QPalette.Button, "#ffffff"),
+        (QPalette.ButtonText, "#172334"), (QPalette.ToolTipBase, "#ffffff"),
+        (QPalette.ToolTipText, "#172334"), (QPalette.Highlight, "#2563eb"),
+        (QPalette.HighlightedText, "#ffffff"), (QPalette.Mid, "#cbd3df"),
+        (QPalette.Light, "#ffffff"), (QPalette.Dark, "#9ca9b9"),
+        (QPalette.PlaceholderText, "#64748b"),
+    ):
+        palette.setColor(role, QColor(color))
+    for role in (QPalette.Text, QPalette.WindowText, QPalette.ButtonText):
+        palette.setColor(QPalette.Disabled, role, QColor("#64748b"))
+    app.setPalette(palette)
+
+
 class _Bridge(QObject):
     """Carries events from the session and rigctld threads to the GUI thread."""
     event = Signal(str, object)
@@ -39,15 +62,43 @@ class _Bridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, settings=None, quicktune_path=None):
         super().__init__()
-        self.setWindowTitle("Icom Remote %s" % __version__)
-        self.settings = settings if settings is not None else QSettings("IcomRemote", "Icom Remote")
+        apply_light_theme(QApplication.instance())
+        self.setWindowTitle("Icom Remote Next %s" % __version__)
+        self.setStyleSheet("""
+            QGroupBox { font-weight: 600; border: 1px solid palette(mid);
+                        border-radius: 6px; margin-top: 8px; padding: 9px 7px 5px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
+            QPushButton { min-height: 22px; padding: 2px 9px; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 22px; }
+            QPushButton:checked { background: #dbeafe; color: #1e40af;
+                                  border: 1px solid #2563eb; border-radius: 4px; }
+            QPushButton#connectAction { background: #2563eb; color: white;
+                                        border: 1px solid #2563eb; border-radius: 4px;
+                                        font-weight: 600; }
+            QPushButton#connectAction:hover { background: #1d4ed8; }
+            QPushButton#connectAction:pressed { background: #1e40af; }
+            QPushButton#recordAction:checked, QPushButton#pttAction:checked {
+                background: #b42332; color: white; border: 1px solid #b42332;
+                border-radius: 4px; font-weight: 600; }
+            QPushButton#voiceArmAction:checked { background: #fef3c7; color: #92400e;
+                border: 1px solid #b45309; border-radius: 4px; font-weight: 600; }
+            QPushButton:disabled { color: #64748b; background: #eef2f7;
+                                   border: 1px solid #cbd3df; border-radius: 4px; }
+        """)
+        self.settings = settings if settings is not None else QSettings("IcomRemoteNext", "Icom Remote Next")
+        self.secrets = SecretStore()
+        self._saved_secret_values = {}
+        self._unread_secrets = set()
+        self._last_connection_error = None
+        self._connection_cancelled = False
+        self._connection_visual_state = None
         self.bridge = _Bridge()
         self.bridge.event.connect(self._on_event, Qt.QueuedConnection)
         self.service = IcomService(on_event=self.bridge.event.emit)
         self.radio = self.service.radio
         self.rigctld = None
         self.api = None
-        self.quicktune_path = quicktune_path or quicktune.default_path()
+        self.quicktune_path = quicktune_path or self.settings.value("quicktune_path", quicktune.default_path())
         self._quicktune_stamp = ()          # (mtime, size) of the file last read; None = no file
         self._editing_freq = False
         self._rec_started = None
@@ -58,24 +109,54 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         root = QVBoxLayout(central)
-        cols = QHBoxLayout()
-        left = QVBoxLayout()                 # receive side
-        left.addWidget(self._build_radio_box())
-        left.addWidget(self._build_tune_box())
-        left.addWidget(self._build_audio_box())
-        left.addWidget(self._build_record_box())
-        left.addStretch(1)
-        right = QVBoxLayout()                # transmit side and CAT
-        right.addWidget(self._build_tx_box())
-        right.addWidget(self._build_quicktune_box())
-        right.addWidget(self._build_rigctl_box())
-        right.addWidget(self._build_api_box())
-        right.addStretch(1)
-        cols.addLayout(left, 1)
-        cols.addLayout(right, 1)
-        root.addLayout(cols, 1)
+        header = QHBoxLayout()
+        title = QLabel("Icom Remote Next")
+        font = QFont(title.font())
+        font.setPointSize(font.pointSize() + 3)
+        font.setBold(True)
+        title.setFont(font)
+        header.addWidget(title)
+        header.addStretch(1)
+        self.state_badge = QLabel("DISCONNECTED")
+        self.state_badge.setAccessibleName("Radio connection state")
+        self.state_badge.setAlignment(Qt.AlignCenter)
+        self.state_badge.setMinimumWidth(150)
+        header.addWidget(self.state_badge)
+        root.addLayout(header)
+        self.connection_error = QLabel(wordWrap=True)
+        self.connection_error.setAccessibleName("Connection failure details")
+        self.connection_error.setTextFormat(Qt.PlainText)
+        self.connection_error.setStyleSheet("background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; border-radius: 5px; padding: 7px;")
+        self.connection_error.hide()
+        root.addWidget(self.connection_error)
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+        radio_box = self._build_radio_box()
+        tune_box = self._build_tune_box()
+        tx_box = self._build_tx_box()
+        quick_box = self._build_quicktune_box()
+        for title, boxes in (
+            ("Radio", (radio_box, tune_box, quick_box, tx_box)),
+            ("Audio", (self._build_audio_box(), self.tx_audio_box)),
+            ("Recording and control", (self._build_record_box(), self._build_rigctl_box(),
+                                      self._build_api_box())),
+        ):
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setSpacing(5)
+            for box in boxes:
+                layout.addWidget(box)
+            layout.addStretch(1)
+            self.tabs.addTab(page, title)
+        self.tabs.currentChanged.connect(self._tab_changed)
+        self.resize(740, 760)
+        self.setMinimumSize(560, 460)
         bottom = QHBoxLayout()
-        bottom.addStretch(1)
+        self.credential_footer = QStackedWidget()
+        self.credential_footer.addWidget(self.password_status)
+        self.credential_footer.addWidget(self.token_status)
+        self.credential_footer.setFixedHeight(2 * self.password_status.fontMetrics().lineSpacing())
+        bottom.addWidget(self.credential_footer, 1)
         exit_btn = QPushButton("Exit")
         exit_btn.setToolTip("Disconnect and close the application")
         exit_btn.clicked.connect(self.close)          # closeEvent saves settings and shuts down
@@ -85,6 +166,12 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
         self._load_settings()
+        self.remember_pw.toggled.connect(self._remember_password_changed)
+        self.password.editingFinished.connect(self._persist_password)
+        self.password.textEdited.connect(lambda _: self._unread_secrets.discard("password"))
+        self.api_token.textEdited.connect(lambda _: self._unread_secrets.discard("api_token"))
+        self.api_token.editingFinished.connect(self._persist_api_token)
+        self._refresh_connection_state()
         self._check_quicktune()
         self._set_controls_enabled(False)
         self._timer = QTimer(self, interval=500, timeout=self._tick)
@@ -108,17 +195,20 @@ class MainWindow(QMainWindow):
         self.user = QLineEdit(placeholderText="network user name set in the radio")
         self.password = QLineEdit(echoMode=QLineEdit.Password)
         self.password.returnPressed.connect(self._connect_clicked)
-        self.remember_pw = QCheckBox("Remember password")
-        self.remember_pw.setToolTip("Stored unencrypted in this computer's settings for the app")
+        self.remember_pw = QCheckBox("Remember password securely")
+        self.remember_pw.setToolTip("Stored in the operating system credential manager; never in app settings")
         self.profile = QComboBox()
         for label, addr in PROFILES.items():
             self.profile.addItem(label, addr)
         self.profile.setToolTip("CI-V address. Auto uses the address the radio reports.")
         self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setObjectName("connectAction")
         self.connect_btn.clicked.connect(self._connect_clicked)
-        self.conn_label = QLabel("Disconnected")
+        self.conn_label = QLabel("Disconnected", wordWrap=True)
+        self.conn_label.setTextFormat(Qt.PlainText)
+        self.password_status = QLabel(wordWrap=True)
         self.info_label = QLabel("")
-        self.info_label.setStyleSheet("color: gray")
+        self.info_label.setStyleSheet("color: #526176")
         self.smeter = QProgressBar(minimum=0, maximum=S_MAX_RAW, textVisible=True)
         self.smeter.setFormat("—")
         self.smeter.setValue(0)
@@ -134,12 +224,7 @@ class MainWindow(QMainWindow):
         g.addWidget(self.password, 2, 1)
         g.addWidget(self.remember_pw, 2, 2, 1, 2)
         g.addWidget(self.conn_label, 3, 0, 1, 4)
-        self.power_btn = QPushButton("Power")
-        self.power_btn.setEnabled(False)
-        self.power_btn.setToolTip("Switch the radio off (its network stays up) or on again.")
-        self.power_btn.clicked.connect(self._power_clicked)
-        g.addWidget(self.info_label, 4, 0, 1, 3)
-        g.addWidget(self.power_btn, 4, 3)
+        g.addWidget(self.info_label, 4, 0, 1, 4)
         g.addWidget(QLabel("S-meter"), 5, 0)
         g.addWidget(self.smeter, 5, 1, 1, 3)
         g.setColumnStretch(1, 1)
@@ -219,7 +304,7 @@ class MainWindow(QMainWindow):
         self.volume_label = QLabel("100%")
         self.volume.valueChanged.connect(lambda v: self.volume_label.setText("%d%%" % v))
         self.audio_stats = QLabel("")
-        self.audio_stats.setStyleSheet("color: gray")
+        self.audio_stats.setStyleSheet("color: #526176")
         g.addWidget(self.audio_enable, 0, 0)
         g.addWidget(self.device_combo, 0, 1)
         g.addWidget(refresh, 0, 2)
@@ -252,6 +337,7 @@ class MainWindow(QMainWindow):
         browse = QPushButton("Folder…")
         browse.clicked.connect(self._choose_dir)
         self.rec_btn = QPushButton("● Record")
+        self.rec_btn.setObjectName("recordAction")
         self.rec_btn.setCheckable(True)
         self.rec_btn.toggled.connect(self._record_toggled)
         self.rec_label = QLabel("")
@@ -268,6 +354,8 @@ class MainWindow(QMainWindow):
     def _build_tx_box(self):
         box = QGroupBox("Transmit")
         g = QGridLayout(box)
+        self.tx_audio_box = QGroupBox("Transmit audio and radio routing")
+        ag = QGridLayout(self.tx_audio_box)
         # data input
         self.tx_enable = QCheckBox("Audio from")
         self.tx_enable.setToolTip("Transmit audio, for data and voice. Pick the transmit virtual cable\n"
@@ -287,6 +375,7 @@ class MainWindow(QMainWindow):
         self.tx_level.setFormat("input level")
         # keying
         self.ptt_btn = QPushButton("PTT", checkable=True)
+        self.ptt_btn.setObjectName("pttAction")
         self.ptt_btn.setMinimumWidth(90)
         self.ptt_btn.setToolTip("Toggle transmit in DATA modes")
         self.ptt_btn.clicked.connect(self._ptt_clicked)
@@ -295,6 +384,7 @@ class MainWindow(QMainWindow):
         self.tx_indicator.setMinimumWidth(44)
         self._style_tx(False)
         self.voice_arm = QPushButton("Voice PTT armed: hold Space", checkable=True)
+        self.voice_arm.setObjectName("voiceArmAction")
         self.voice_arm.setToolTip("While armed, holding the space bar anywhere in this window transmits\n"
                                   "(voice in LSB/USB/AM/FM, data in DATA modes), even in a text field.\n"
                                   "Releasing Space, disarming, or the window losing focus stops\n"
@@ -315,17 +405,17 @@ class MainWindow(QMainWindow):
         self.tuner_label = QLabel("Tuner: —")
         self.ptt_timeout = QSpinBox(minimum=10, maximum=600, value=180, suffix=" s")
         self.ptt_timeout.setToolTip("Transmit is cut off after this long, whatever keyed it")
-        self.ptt_timeout.valueChanged.connect(lambda v: setattr(self.radio, "ptt_timeout", float(v)))
+        self.ptt_timeout.valueChanged.connect(lambda v: self.service.configure_transmit(timeout=v))
         # radio settings
         self.manage_data_mod = QCheckBox("DATA MOD → LAN")
         self.manage_data_mod.setToolTip("Switch DATA MOD (data-mode audio source) to LAN while connected;\n"
                                         "the original is saved and put back on disconnect")
-        self.manage_data_mod.toggled.connect(lambda on: setattr(self.radio, "manage_data_mod", on))
+        self.manage_data_mod.toggled.connect(lambda on: self.service.configure_transmit(manage_data_mod=on))
         self.manage_data_off_mod = QCheckBox("DATA OFF MOD → LAN")
         self.manage_data_off_mod.setToolTip("Switch DATA OFF MOD (voice-mode audio source) to LAN while\n"
                                             "connected; the original is saved and put back on disconnect.\n"
                                             "While it is LAN, a microphone plugged into the radio is not used.")
-        self.manage_data_off_mod.toggled.connect(lambda on: setattr(self.radio, "manage_data_off_mod", on))
+        self.manage_data_off_mod.toggled.connect(lambda on: self.service.configure_transmit(manage_data_off_mod=on))
         self.data_mod_label = QLabel("")
         self.data_mod_label.setWordWrap(True)
         self.restore_btn = QPushButton("Restore now")
@@ -334,13 +424,13 @@ class MainWindow(QMainWindow):
         self.restore_btn.clicked.connect(self._restore_clicked)
         self.restore_btn.setEnabled(False)
 
-        g.addWidget(self.tx_enable, 0, 0)
-        g.addWidget(self.tx_combo, 0, 1, 1, 3)
-        g.addWidget(tx_refresh, 0, 4)
-        g.addWidget(QLabel("Gain"), 1, 0)
-        g.addWidget(self.tx_gain, 1, 1)
-        g.addWidget(self.tx_gain_label, 1, 2)
-        g.addWidget(self.tx_level, 1, 3)
+        ag.addWidget(self.tx_enable, 0, 0)
+        ag.addWidget(self.tx_combo, 0, 1, 1, 3)
+        ag.addWidget(tx_refresh, 0, 4)
+        ag.addWidget(QLabel("Gain"), 1, 0)
+        ag.addWidget(self.tx_gain, 1, 1)
+        ag.addWidget(self.tx_gain_label, 1, 2)
+        ag.addWidget(self.tx_level, 1, 3)
         row = QHBoxLayout()
         row.addWidget(self.ptt_btn)
         row.addWidget(self.tx_indicator)
@@ -377,16 +467,16 @@ class MainWindow(QMainWindow):
             mk.setToolTip("pactl load-module module-null-sink sink_name=IcomTX\n"
                           "WSJT-X/fldigi play to 'IcomTX'; transmit audio comes from 'Monitor of IcomTX'.")
             mk.clicked.connect(self._create_tx_sink)
-            g.addWidget(mk, 1, 4)
+            ag.addWidget(mk, 1, 4)
         mods = QHBoxLayout()
         mods.addWidget(QLabel("While connected:"))
         mods.addWidget(self.manage_data_mod)
         mods.addWidget(self.manage_data_off_mod)
         mods.addStretch(1)
-        g.addLayout(mods, 7, 0, 1, 5)
-        g.addWidget(self.data_mod_label, 8, 0, 1, 4)
-        g.addWidget(self.restore_btn, 8, 4)
-        g.setColumnStretch(1, 1)
+        ag.addLayout(mods, 7, 0, 1, 5)
+        ag.addWidget(self.data_mod_label, 8, 0, 1, 4)
+        ag.addWidget(self.restore_btn, 8, 4)
+        ag.setColumnStretch(1, 1)
         return box
 
     def _build_rigctl_box(self):
@@ -395,8 +485,8 @@ class MainWindow(QMainWindow):
         self.rig_enable = QCheckBox("Enable")
         self.rig_enable.toggled.connect(self._toggle_rigctld)
         self.rig_addr = QComboBox(editable=True)
-        self.rig_addr.addItems(["127.0.0.1", "0.0.0.0", "::1"])
-        self.rig_addr.setToolTip("127.0.0.1 = this computer only; 0.0.0.0 = allow LAN clients")
+        self.rig_addr.addItems(["127.0.0.1", "::1"])
+        self.rig_addr.setToolTip("Keep loopback binding; use an authenticated tunnel for remote CAT control")
         self.rig_port = QSpinBox(minimum=1, maximum=65535, value=4532)
         self.rig_plain_data = QCheckBox("Plain USB/LSB from rigctl or the API selects USB-D/LSB-D")
         self.rig_plain_data.setToolTip("PKTUSB/PKTLSB always select DATA mode. With this on,\n"
@@ -416,7 +506,7 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_quicktune_box(self):
-        box = QGroupBox("Quick tune")
+        box = QGroupBox("Presets")
         box.setToolTip("Buttons from %s\n(one 'name, kHz' per line, up to %d; names up to %d characters)"
                        % (self.quicktune_path, quicktune.MAX_BUTTONS, quicktune.MAX_LABEL))
         g = QGridLayout(box)
@@ -432,7 +522,33 @@ class MainWindow(QMainWindow):
         self._quicktune_entries = []
         self.quicktune_box = box
         box.hide()
-        return box
+        holder = QWidget()
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Preset frequencies"))
+        header.addStretch(1)
+        self.import_freq_btn = QPushButton("Import presets…")
+        self.import_freq_btn.clicked.connect(self._import_frequencies)
+        header.addWidget(self.import_freq_btn)
+        layout.addLayout(header)
+        layout.addWidget(box)
+        return holder
+
+    def _import_frequencies(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import preset frequencies", "", "Frequency files (*.txt *.csv);;All files (*)")
+        if not path:
+            return
+        entries, problems = quicktune.load(path)
+        if not entries:
+            QMessageBox.warning(self, "Import preset frequencies", "No valid 'name, kHz' entries were found.")
+            return
+        self.quicktune_path = path
+        self.settings.setValue("quicktune_path", path)
+        self._quicktune_stamp = ()
+        self._check_quicktune()
+        self.quicktune_box.setToolTip(path)
+
 
     def _build_api_box(self):
         box = QGroupBox("Remote control API (schedulers, scripts)")
@@ -445,11 +561,15 @@ class MainWindow(QMainWindow):
         self.api_port = QSpinBox(minimum=1, maximum=65535, value=API_DEFAULT_PORT)
         self.api_token = QLineEdit(echoMode=QLineEdit.Password, placeholderText="token (optional)")
         self.api_status = QLabel("Off")
+        self.token_status = QLabel(wordWrap=True)
+        self.save_token_btn = QPushButton("Save token securely")
+        self.save_token_btn.clicked.connect(self._persist_api_token)
         g.addWidget(self.api_enable, 0, 0)
         g.addWidget(QLabel("Port"), 0, 1)
         g.addWidget(self.api_port, 0, 2)
         g.addWidget(self.api_token, 0, 3)
         g.addWidget(self.api_status, 1, 0, 1, 4)
+        g.addWidget(self.save_token_btn, 2, 3)
         g.setColumnStretch(3, 1)
         return box
 
@@ -461,7 +581,8 @@ class MainWindow(QMainWindow):
         remember = s.value("remember_pw", False, type=bool)
         self.remember_pw.setChecked(remember)
         if remember:
-            self.password.setText(s.value("password", ""))
+            self.password.setText(self._load_secret("password"))
+        s.remove("password")
         i = self.profile.findText(s.value("profile", ""))
         self.profile.setCurrentIndex(i if i >= 0 else 0)
         idx = self.step.findData(s.value("step", 1000, type=int))
@@ -477,11 +598,11 @@ class MainWindow(QMainWindow):
         self._refresh_tx_devices(select=s.value("tx_device", ""))
         self.tx_gain.setValue(s.value("tx_gain", 100, type=int))
         self.ptt_timeout.setValue(s.value("ptt_timeout", 180, type=int))
-        self.radio.ptt_timeout = float(self.ptt_timeout.value())
+        self.service.configure_transmit(timeout=self.ptt_timeout.value())
         self.manage_data_mod.setChecked(s.value("manage_data_mod", True, type=bool))
-        self.radio.manage_data_mod = self.manage_data_mod.isChecked()
+        self.service.configure_transmit(manage_data_mod=self.manage_data_mod.isChecked())
         self.manage_data_off_mod.setChecked(s.value("manage_data_off_mod", True, type=bool))
-        self.radio.manage_data_off_mod = self.manage_data_off_mod.isChecked()
+        self.service.configure_transmit(manage_data_off_mod=self.manage_data_off_mod.isChecked())
         if s.value("tx_enable", False, type=bool) and self.tx_combo.currentData():
             self.tx_enable.setChecked(True)
         self._show_pending_restores()
@@ -490,7 +611,8 @@ class MainWindow(QMainWindow):
         self.rig_plain_data.setChecked(s.value("rig_plain_data", True, type=bool))
         self.service.plain_ssb_is_data = self.rig_plain_data.isChecked()
         self.api_port.setValue(s.value("api_port", API_DEFAULT_PORT, type=int))
-        self.api_token.setText(s.value("api_token", ""))
+        self.api_token.setText(self._load_secret("api_token"))
+        s.remove("api_token")
         self.api_enable.blockSignals(True)
         self.api_enable.setChecked(s.value("api_enable", False, type=bool))
         self.api_enable.blockSignals(False)
@@ -503,15 +625,102 @@ class MainWindow(QMainWindow):
         if s.value("audio_enable", False, type=bool) and self.device_combo.currentData():
             self.audio_enable.setChecked(True)
 
+    def _credential_feedback(self, key, message, error=False):
+        label = self.password_status if key == "password" else self.token_status
+        label.setText(message)
+        label.setToolTip(message)
+        label.setStyleSheet("color: #991b1b" if error else "color: #166534")
+        if error:
+            self.statusBar().showMessage(message, 10000)
+
+    def _secret_identifier(self, key):
+        parts = [self.settings.fileName(), key]
+        if key == "password":
+            parts.extend((self.host.text().strip(), self.user.text().strip()))
+        return self.secrets.identifier(*parts)
+
+    def _load_secret(self, key):
+        legacy = self.settings.value(key, "")
+        identifier = self.settings.value(key + "_secret_id", "")
+        if not identifier:
+            return legacy
+        label = "Password" if key == "password" else "API token"
+        try:
+            value = self.secrets.get(identifier)
+            if value:
+                self._saved_secret_values[key] = (identifier, value)
+                self._credential_feedback(key, label + " loaded securely from " + self.secrets.display_name + ".")
+            else:
+                self._unread_secrets.add(key)
+                self._credential_feedback(key, label + " was not found in " + self.secrets.display_name + "; enter and save it again.", True)
+            return value
+        except Exception:
+            self._unread_secrets.add(key)
+            self._credential_feedback(key, "Could not read " + label.lower() + " from " + self.secrets.display_name + ". Unlock or allow access to the credential store and try again.", True)
+            return ""
+
+    def _save_secret(self, key, value):
+        previous = self.settings.value(key + "_secret_id", "")
+        label = "Password" if key == "password" else "API token"
+        if not value and key in self._unread_secrets:
+            return False  # a failed read must never erase an existing secret on exit
+        if not value and not previous:
+            self._credential_feedback(key, "")
+            return True
+        identifier = self._secret_identifier(key)
+        if value and self._saved_secret_values.get(key) == (identifier, value):
+            self._credential_feedback(key, label + " saved securely in " + self.secrets.display_name + ".")
+            return True
+        try:
+            if value:
+                self.secrets.set(identifier, value)
+            if previous and (not value or previous != identifier):
+                self.secrets.delete(previous)
+        except Exception as exc:
+            log.warning("Credential store operation failed for %s: %s", key, type(exc).__name__)
+            action = "save " if value else "remove "
+            self._credential_feedback(key, "Could not " + action + label.lower() + " in " + self.secrets.display_name + ". Check access and try again.", True)
+            return False
+        self._unread_secrets.discard(key)
+        if value:
+            self.settings.setValue(key + "_secret_id", identifier)
+            self._saved_secret_values[key] = (identifier, value)
+            self._credential_feedback(key, label + " saved securely in " + self.secrets.display_name + ".")
+        else:
+            self.settings.remove(key + "_secret_id")
+            self._saved_secret_values.pop(key, None)
+            self._credential_feedback(key, label + " removed from " + self.secrets.display_name + ".")
+        self.settings.sync()
+        return True
+
+    @Slot(bool)
+    def _remember_password_changed(self, checked):
+        if not checked:
+            self._unread_secrets.discard("password")
+        self.settings.setValue("remember_pw", checked)
+        self._persist_password()
+
+    def _persist_password(self):
+        self.settings.setValue("host", self.host.text().strip())
+        self.settings.setValue("user", self.user.text().strip())
+        self.settings.setValue("remember_pw", self.remember_pw.isChecked())
+        self._save_secret("password", self.password.text() if self.remember_pw.isChecked() else "")
+        self.settings.remove("password")
+        self.settings.sync()
+
+    @Slot()
+    def _persist_api_token(self):
+        self._save_secret("api_token", self.api_token.text())
+        self.settings.remove("api_token")
+        self.settings.sync()
+
     def _save_settings(self):
         s = self.settings
         s.setValue("host", self.host.text().strip())
         s.setValue("user", self.user.text().strip())
         s.setValue("remember_pw", self.remember_pw.isChecked())
-        if self.remember_pw.isChecked():
-            s.setValue("password", self.password.text())
-        else:
-            s.remove("password")
+        self._save_secret("password", self.password.text() if self.remember_pw.isChecked() else "")
+        s.remove("password")
         s.setValue("profile", self.profile.currentText())
         s.setValue("step", self.step.currentData())
         s.setValue("audio_device", self.device_combo.currentData() or "")
@@ -531,14 +740,20 @@ class MainWindow(QMainWindow):
         s.setValue("rig_plain_data", self.rig_plain_data.isChecked())
         s.setValue("api_enable", self.api_enable.isChecked())
         s.setValue("api_port", self.api_port.value())
-        s.setValue("api_token", self.api_token.text())
+        self._save_secret("api_token", self.api_token.text())
+        s.remove("api_token")
         s.setValue("geometry2", self.saveGeometry())
+        s.setValue("quicktune_path", self.quicktune_path)
+        s.sync()
 
     # ================================================================== connection
     def _connect_clicked(self, *_):
         if self.radio.running:
-            self.radio.disconnect()
+            self._connection_cancelled = True
+            self._last_connection_error = None
+            self.service.disconnect()
             self.connect_btn.setText("Connect")
+            self._refresh_connection_state()
             return
         host, user = self.host.text().strip(), self.user.text().strip()
         if not host or not user:
@@ -546,45 +761,40 @@ class MainWindow(QMainWindow):
             return
         spec = ConnectionSpec(host, user, self.password.text(), civ_address=self.profile.currentData())
         self._save_settings()
-        self.radio.connect(spec)
-        self.connect_btn.setText("Disconnect")
+        self._connection_cancelled = False
+        self._last_connection_error = None
+        try:
+            self.service.connect(spec)
+        except RuntimeError as exc:
+            self._last_connection_error = str(exc)
+        self._refresh_connection_state()
 
-    def _update_power_btn(self, powering_on=False):
-        p = self.radio.power if self.radio.connected else None
-        if powering_on:
-            self.power_btn.setText("Powering on …")
-            self.power_btn.setEnabled(False)
-        elif p == "on":
-            self.power_btn.setText("Power OFF")
-            self.power_btn.setEnabled(True)
-        elif p == "standby":
-            self.power_btn.setText("Power ON")
-            self.power_btn.setEnabled(True)
+    def _refresh_connection_state(self):
+        running = self.radio.running
+        error = None if self._connection_cancelled else (self.radio.last_error or self._last_connection_error)
+        if self.radio.connected:
+            self._last_connection_error = None
+            error = None
+            state = "STANDBY" if self.radio.power == "standby" else "CONNECTED"
+            color = "#92400e" if state == "STANDBY" else "#166534"
+        elif error or (self.radio.failed and not self._connection_cancelled):
+            state = "FAILED · RETRYING" if running and not self.radio.failed else "CONNECTION FAILED"
+            color = "#991b1b"
+            error = error or "The radio connection failed."
+        elif running:
+            state, color = "CONNECTING…", "#92400e"
         else:
-            self.power_btn.setText("Power")
-            self.power_btn.setEnabled(False)
-
-    def _power_clicked(self, *_):
-        if self.radio.power == "on":
-            note = ("Its network normally stays up, so it can be switched on again from here "
-                    "(verified on the IC-7300MK2). If it doesn't, switch it on at the radio.")
-            if self.radio.ptt or self.radio.tx:
-                note = "Transmit will be stopped. " + note
-            ans = QMessageBox.question(self, "Power off",
-                                       "Switch the radio off?\n\nDATA MOD / DATA OFF MOD are put back "
-                                       "first.\n" + note,
-                                       QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if ans != QMessageBox.Yes:
-                return
-            try:
-                self.radio.power_off()
-            except NotConnected as e:
-                self.statusBar().showMessage(str(e), 5000)
-        else:
-            try:
-                self.radio.power_on()
-            except NotConnected as e:
-                self.statusBar().showMessage(str(e), 5000)
+            state, color = "DISCONNECTED", "#526176"
+        visual = (state, color)
+        if visual != self._connection_visual_state:
+            self.state_badge.setText(state)
+            self.state_badge.setStyleSheet("background: %s; color: white; border-radius: 6px; padding: 6px 12px; font-weight: 600;" % color)
+            self._connection_visual_state = visual
+        self.state_badge.setToolTip(error or state.capitalize())
+        self.connection_error.setText(("Connection failed: " + str(error)) if error else "")
+        self.connection_error.setVisible(bool(error))
+        self.connect_btn.setText("Disconnect" if running else "Connect")
+        self.conn_label.setVisible(not error)
 
     def _set_controls_enabled(self, on):
         for w in (self.freq, self.data_btn, self.ptt_btn, self.voice_arm, self.rf_power, self.tune_btn,
@@ -626,20 +836,20 @@ class MainWindow(QMainWindow):
     @Slot(float)
     def _freq_edited(self, khz):
         self._editing_freq = False
-        self._control(self.radio.set_frequency, khz * 1000.0)
+        self._control(self.service.set_frequency, khz * 1000.0)
 
     def _mode_clicked(self, button):
-        self._control(self.radio.set_mode, button.text(), self.data_btn.isChecked())
+        self._control(self.service.set_mode, button.text(), self.data_btn.isChecked())
 
     def _data_clicked(self, on):
         mode = self.radio.rig.mode
         if mode in BASE_MODES:
-            self._control(self.radio.set_mode, mode, on)
+            self._control(self.service.set_mode, mode, on)
         else:
             self.data_btn.setChecked(not on)
 
     def _filter_clicked(self, n):
-        self._control(self.radio.set_filter, n)
+        self._control(self.service.set_filter, n)
 
     def _check_quicktune(self):
         """(Re)load the quick-tune file when it appears, changes or goes away."""
@@ -667,12 +877,12 @@ class MainWindow(QMainWindow):
 
     def _quicktune_clicked(self, i):
         if i < len(self._quicktune_entries):
-            self._control(self.radio.set_frequency, self._quicktune_entries[i][1])
+            self._control(self.service.set_frequency, self._quicktune_entries[i][1])
 
     def _control(self, fn, *args):
         try:
             fn(*args)
-        except (NotConnected, ValueError) as e:
+        except (NotConnected, PttRefused, ValueError, RuntimeError) as e:
             self.statusBar().showMessage(str(e), 5000)
             self._show_rig(self.radio.rig)
 
@@ -700,7 +910,7 @@ class MainWindow(QMainWindow):
             self.audio_enable.setChecked(False)
             return
         try:
-            self.radio.set_audio_device(key, self.volume.value() / 100.0)
+            self.service.set_audio_device(key, self.volume.value() / 100.0)
         except Exception as e:
             QMessageBox.warning(self, "Audio device", str(e))
             self.audio_enable.blockSignals(True)
@@ -811,7 +1021,7 @@ class MainWindow(QMainWindow):
                                     "Use a second virtual cable for transmit (see the README).")
                 self.tx_enable.setChecked(False)
                 return
-        self.radio.set_tx_device(key, self.tx_gain.value() / 100.0)
+        self.service.set_tx_device(key, self.tx_gain.value() / 100.0)
 
     def _tx_device_changed(self, *_):
         if self.tx_enable.isChecked():
@@ -819,11 +1029,11 @@ class MainWindow(QMainWindow):
 
     def _tx_gain_changed(self, v):
         self.tx_gain_label.setText("%d%%" % v)
-        self.radio.set_tx_gain(v / 100.0)
+        self.service.set_tx_gain(v / 100.0)
 
     def _ptt_clicked(self, on):
         try:
-            self.radio.set_ptt(on, owner=self)
+            self.service.set_ptt(on, owner=self)
         except PttRefused as e:
             self.ptt_btn.setChecked(False)
             self.statusBar().showMessage(str(e), 8000)
@@ -836,7 +1046,7 @@ class MainWindow(QMainWindow):
 
     def _restore_clicked(self, *_):
         try:
-            self.radio.restore_data_mod_now()
+            self.service.restore_data_mod_now()
         except NotConnected as e:
             self.statusBar().showMessage(str(e), 5000)
 
@@ -874,13 +1084,13 @@ class MainWindow(QMainWindow):
     def _rf_power_changed(self, v):
         self.rf_power_label.setText("%d %%" % v)
         try:
-            self.radio.set_rf_power(v)
+            self.service.set_rf_power(v)
         except NotConnected as e:
             self.statusBar().showMessage(str(e), 5000)
 
     def _tune_clicked(self, *_):
         try:
-            self.radio.tune()
+            self.service.start_tuner()
         except (NotConnected, PttRefused) as e:
             self.statusBar().showMessage(str(e), 8000)
 
@@ -916,7 +1126,7 @@ class MainWindow(QMainWindow):
         self._style_swr_dot(swr if self._on_air else None)
 
     def _style_arm(self, armed):
-        self.voice_arm.setStyleSheet("background: #e67e22; color: white; font-weight: bold" if armed else "")
+        self.voice_arm.setText("Voice PTT armed: hold Space" if armed else "Arm voice PTT")
 
     @Slot(bool)
     def _voice_arm_toggled(self, armed):
@@ -929,12 +1139,19 @@ class MainWindow(QMainWindow):
                 fw.clearFocus()               # out of any text field: Space is PTT now
             self.statusBar().showMessage("Voice PTT armed: hold the space bar to transmit", 5000)
 
+    @Slot(int)
+    def _tab_changed(self, index):
+        self.credential_footer.setCurrentIndex(1 if index == 2 else 0)
+        if index != 0:
+            self._space_release()
+            self.voice_arm.setChecked(False)
+
     def _space_press(self):
         if self._space_down:
             return
         self._space_down = True
         try:
-            self.radio.set_ptt(True, owner=self._space_owner, voice_ok=True)
+            self.service.set_ptt(True, owner=self._space_owner, voice_ok=True)
         except PttRefused as e:
             self.statusBar().showMessage(str(e), 8000)
 
@@ -942,7 +1159,7 @@ class MainWindow(QMainWindow):
         if not self._space_down:
             return
         self._space_down = False
-        self.radio.release_ptt(self._space_owner, reason=None)
+        self.service.release_ptt(self._space_owner, reason=None)
 
     def eventFilter(self, obj, ev):
         t = ev.type()
@@ -952,7 +1169,7 @@ class MainWindow(QMainWindow):
             return True
         if t in (QEvent.KeyPress, QEvent.KeyRelease) and ev.key() == Qt.Key_Space:
             # Armed: Space is PTT anywhere in the window, even in a text field.
-            if self.voice_arm.isChecked() and self.isActiveWindow():
+            if self.tabs.currentIndex() == 0 and self.voice_arm.isChecked() and self.isActiveWindow():
                 if not ev.isAutoRepeat():
                     if t == QEvent.KeyPress:
                         self._space_press()
@@ -977,9 +1194,9 @@ class MainWindow(QMainWindow):
         try:
             self.rigctld = RigctldServer(self.radio, self.rig_addr.currentText().strip(),
                                          self.rig_port.value(), on_activity=self._rig_activity,
-                                         plain_ssb_is_data=self.rig_plain_data.isChecked())
+                                         plain_ssb_is_data=self.rig_plain_data.isChecked(), service=self.service)
             self.rigctld.start()
-        except OSError as e:
+        except (OSError, ValueError) as e:
             self.rigctld = None
             self.rig_status.setText("Could not listen: %s" % e)
             self.rig_enable.blockSignals(True)
@@ -1054,6 +1271,8 @@ class MainWindow(QMainWindow):
                 self._show_tuner(2)
         elif kind == "status":
             text, level = payload
+            if level == "error" and not self.radio.connected and self.radio.running:
+                self._last_connection_error = text
             self.conn_label.setText(text)
             self.conn_label.setStyleSheet("color: #c0392b" if level == "error" else "")
         elif kind == "radio":
@@ -1065,17 +1284,13 @@ class MainWindow(QMainWindow):
             self.info_label.setText(self._radio_info)
         elif kind == "power":
             self._set_controls_enabled(self.radio.connected and payload == "on")
-            self._update_power_btn()
             if payload == "standby":
                 self.smeter.setValue(0)
                 self.smeter.setFormat("standby")
-        elif kind == "powering_on":
-            self._update_power_btn(powering_on=payload)
         elif kind == "remote_power_setting":
             pass                                  # logged only; its effect on the LAN is unclear
         elif kind == "connected":
             self._set_controls_enabled(payload and self.radio.power == "on")
-            self._update_power_btn()
             if payload:
                 self.connect_btn.setText("Disconnect")
             else:
@@ -1137,7 +1352,11 @@ class MainWindow(QMainWindow):
         elif kind == "rig_command":
             self.statusBar().showMessage("rigctl: %s" % payload, 3000)
 
+        if kind in ("status", "connected", "stopped", "power"):
+            self._refresh_connection_state()
+
     def _tick(self, *_):
+        self._refresh_connection_state()
         self._check_quicktune()
         if self.radio.recording_seconds() is not None and self._rec_started is not None:
             wall = time.monotonic() - self._rec_started
@@ -1166,7 +1385,7 @@ class MainWindow(QMainWindow):
 
 def run(argv):
     app = QApplication(argv)
-    app.setApplicationName("Icom Remote")
+    app.setApplicationName("Icom Remote Next")
     w = MainWindow()
     w.show()
     return app.exec()

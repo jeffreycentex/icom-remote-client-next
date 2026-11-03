@@ -1,8 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Context for working on this repo. Read this first. README.md is the user-facing
-documentation; this file holds the decisions, protocol findings and working
-conventions behind it.
+Project instructions and engineering reference for Icom Remote Next. See README.md for end-user setup and docs/API.md for the HTTP contract.
 
 ## Project
 
@@ -20,18 +18,12 @@ protocol into the existing Python app design.
 Out of scope by decision: virtual serial port, TCP serial server, waterfall /
 scope, CW/RTTY modes.
 
-## Owner and working style
+## Working conventions
 
-- Engineer (BS Engineering, MS Computer Science). Prefers direct answers.
-- Tests on macOS with Homebrew **Python 3.15**, WSJT-X, BlackHole 2ch (RX) +
-  BlackHole 16ch (TX). Linux: audio cables tested by the owner; WSJT-X /
-  JS8Call on Linux **not confirmed** (with kiwisdr-remote the owner saw the
-  sinks missing from their device lists; README has the remap-source
-  workaround, untried). Windows not tested on hardware.
-- Builds in numbered steps; each is tested on the real radio before the next.
-- For ambiguous or safety-relevant changes, ask before building.
-- Commits: author `jeffreycentex <jeffreycentex@gmail.com>`; end messages with
-  the session's Co-Authored-By / Claude-Session lines. Push to `main`.
+- This repository is `jeffreycentex/icom-remote-client-next`. Keep the original client checkout separate and verify the Git remote before pushing.
+- Make small changes through the existing service boundary and verify the normal GUI entry point.
+- Use the fake radio for transmit, tune, power and menu-write tests. Live checks are receive-only unless the user explicitly authorizes transmission or a radio state change. Use temporary state and disable both MOD management options for receive-only checks.
+- Keep real credentials out of source, test fixtures, diagnostics and logs. Ask for relevant sanitized log lines rather than complete packet captures.
 
 ## Status
 
@@ -41,7 +33,7 @@ scope, CW/RTTY modes.
 | 2 | GUI, freq/mode/filter, S-meter, rigctld | verified |
 | 3 | TX audio, PTT safety, DATA MOD + DATA OFF MOD switch/restore, voice PTT (armed Space), recording | verified (spots on PSKReporter; DATA MOD restore confirmed) |
 | 4 | RF power, TUNE, Output/SWR readout | TUNE + PTT verified; readout redesigned after feedback |
-| 5 | Power ON/OFF | verified on IC-7300MK2 (off, on, connect while off) |
+| 5 | Standby detection | Session power logic covered by tests. GUI power button removed by request. |
 | 6 | PyInstaller builds + CI | CI green on macOS, Windows, Linux (tests incl. GUI, build, built-app self-check); owner to test the .app and a Windows build on hardware |
 | 0.9 | IC-9700 / IC-7610 profiles, per-model menu table (`civ.MODELS`), Linux audio docs, README uses `run_icomremote.py` | tagged `v0.9`; **IC-705 confirmed working by the owner** (2026-10-31); IC-9700 / IC-7610 fake radio only |
 | API | Remote control API v1 (kiwisdr-remote compatible subset) for FLDigi Net Scheduler: status, tune, record/start, record/stop; `ctl` client | verified by the owner (scheduler, token) |
@@ -81,16 +73,9 @@ scope, CW/RTTY modes.
 - **Meters**: bar = S-meter always. Separate "Output NN %  SWR N.N" readout
   next to PTT timeout with a dot: green < 1.5, yellow < 2.5, red >= 2.5,
   grey off-air. (A bar that switched to Po/SWR on TX confused the owner.)
-- **Layout**: two columns. Left: radio, tuning, RX audio, recording. Right:
-  transmit, rigctld. Avoid making the window taller.
-- **Quick tune** (2026-10-31): up to 10 buttons, frequency only, from
-  `<settings dir>/quicktune.txt` (`name, kHz` per line, names max 10 chars).
-  No file = box hidden; the file is re-read when it changes (checked every
-  0.5 s). Right column under Transmit; the rigctld hint went into a tooltip
-  to keep the window height. GUI tests pass a temp `quicktune_path`.
-- **Power ON/OFF** (step 5): OFF with a confirm dialog (unkey + MOD restore
-  first). ON works over the LAN on the IC-7300MK2. Where a radio's network
-  drops when off, Power ON is simply unreachable (not connected).
+- **Layout**: Radio contains connection, tuning, presets and both PTT controls. Audio contains device and routing settings. Recording and control contains recording, CAT and HTTP settings. Tabs use direct layouts with no scroll areas. Verify fit with ten presets and the connection error banner. Display the connection failure once, in the header. Credential feedback shares a fixed-height slot beside Exit, with password on Radio and token on Recording and control.
+- **Presets**: up to 10 frequency-only buttons from a file containing `name, kHz` per line, names max 10 characters. The default is `quicktune.txt` in the state directory. Import remembers the chosen path. The file is checked every 0.5 seconds. Tests inject a temporary `quicktune_path`.
+- **Standby**: show state and disable tuning and TX. Use the radio's physical power control. Preserve session-level power handling and its regression tests.
 - `samplerate` removed from requirements (Windows build pain; linear
   resampling is inaudible at 48 kHz). PyAV stays for M4A.
 
@@ -103,7 +88,7 @@ scope, CW/RTTY modes.
   button, armed Space, rigctld `T`); owner's clarification. The only TX
   interaction is API `/tune` being refused while on air.
 - `/tune` is **refused (409 `transmitting`) while keyed, keying, tuning or the
-  radio reports TX**; the check and the change run under `_ptt_lock`
+  radio reports TX**; the check and the change run together on the session event loop
   (`test_tune_never_reaches_the_radio_while_keyed`). Plain USB/LSB follow the
   rigctl "plain = data" checkbox (one setting for both). Passband ignored.
 - Default port 7373 = KiwiSDR Remote's, so the scheduler needs no change.
@@ -123,7 +108,10 @@ icomremote/
                 PTT/TX/DATA MOD/tuner logic; audio sinks.
   rigctld.py    hamlib NET rigctl (model 2) server, threaded TCP; from
                 kiwisdr-remote. Tracks which client keyed PTT.
-  service.py    IcomService: tune / record / status for the API; owns the session.
+  service.py    IcomService: shared control boundary for GUI, CAT and HTTP.
+  commands.py   Bounded command worker for ordinary mutations.
+  network.py    Tracks and closes active TCP clients and bounds connections.
+  secrets.py    Native credential provider selection and storage.
   api.py        HTTP/JSON API server (stdlib), from kiwisdr-remote.
   ctl.py        ApiClient + `ctl` command line.
   civ.py        CI-V framing/BCD, decoder -> (kind, value) events, meter
@@ -143,10 +131,19 @@ tests/          fake_rsba1.py (fake radio over real UDP) + unit, end-to-end,
                 TX, step-4 and GUI tests.
 ```
 
-Threads: GUI thread; session thread (asyncio; the only one touching sockets);
-PortAudio callback threads (RX playback, TX capture); rigctld threads; API
-server threads and the service ticker (recording max_seconds). Cross
-into the loop only with `call_soon_threadsafe` / `run_coroutine_threadsafe`.
+Threads: Qt GUI, asyncio radio session, bounded application command worker, recording writer, PortAudio callbacks, TCP handlers and service ticker. GUI and CAT mutations go through IcomService. PTT goes directly through the service to the session loop so a recording drain cannot delay key-up. Never synchronously submit service commands from a session or recording-worker callback. Cross into the session with its thread-safe control interface.
+
+- The radio loop owns PTT, its client owner, actual keying and the deadline. Repeated presses never extend the deadline. A second client cannot take over a held key. Leaving Radio disarms voice and releases held Space.
+- Stop each TCP server by closing its listener and active sockets. CAT is loopback only, rejects HTTP requests and releases clients' PTT on shutdown. Preserve HTTP Host checks, token and JSON validation, size limits and connection timeouts.
+- Recording uses a bounded FIFO writer. Stop drains accepted audio before container finalization. On overflow report an error. Never wait for the writer while holding the sink lock. Queue reconnect silence compactly. Use exclusive file creation for every WAV/AAC segment and bound filename template expansion.
+
+## Credentials and connection diagnosis
+
+- Next uses QSettings identity `IcomRemoteNext` / `Icom Remote Next` and separate state. `ICOM_REMOTE_STATE_DIR` overrides the restore/log/preset directory, not the QSettings identity. Inject temporary QSettings for GUI tests.
+- Use native macOS Keychain, Windows Credential Manager, Linux Secret Service/KWallet/libsecret. Filter backend chains to native providers. QSettings stores opaque identifiers only. An unreadable credential must survive exit with an empty field. Saving is immediate on Remember and password edit completion, and the API token has a Save button.
+- Keychain may ask for access on app startup when it reads credentials, especially after replacing a build. A temporary native round trip has passed in both source and the macOS bundle. Windows/Linux provider selection has simulated test coverage.
+- A control handshake timeout on UDP 50001 happens before login. Check the route and UDP reachability. Ping confirms IP reachability only. Check the app log for a later successful retry or a radio-in-use reply before starting another session. Fixed local ports are a diagnostic option and can collide with other sockets.
+- Successful live receive-only check on IC-7300MK2 B6h at 3.595 MHz USB-D verified GUI readback, HTTP status, a 48 kHz mono WAV and clean shutdown. Avoid treating that check as TX coverage.
 
 ## RS-BA1 protocol notes
 
@@ -206,7 +203,7 @@ To add a model: take the numbers from its Icom CI-V reference guide, add a
 Scales: S-meter 0=S0, 120=S9, 241=S9+60. Po 143=50 %, 213=100 %. SWR 48=1.5,
 80=2.0, 120=3.0.
 
-## Power (step 5) design and unknowns
+## Session standby and power protocol
 
 - Power state = CI-V liveness: `on` if the radio answers state reads,
   `standby` if CI-V is silent > 3 s while the UDP session is alive. Bare
@@ -239,10 +236,7 @@ Scales: S-meter 0=S0, 120=S9, 241=S9+60. Po 143=50 %, 213=100 %. SWR 48=1.5,
   per-group read counters and fences (`_fence`, `_reads_sent`, `_replies`):
   replies to reads sent before a change are ignored for that group. Same
   idea for tuner status at tune start (`_tune_fence`).
-- **PTT request ordering**: a stale release could clear a newer press, so
-  the radio stayed keyed. Fix: sequence-numbered requests under
-  `_ptt_lock`; only the newest applies; automatic unkeys go through
-  `_unkey()`, which also bumps the sequence.
+- **PTT request ordering**: requests and automatic unkey run on the session event loop. Preserve owner identity and cancellation of pending key-down so a stale release or stale confirmation cannot leave TX keyed.
 
 - **Restore vs. a running MOD switch** (macOS CI, 2026-10-31): after Power ON
   the wake-up setup runs as a task and switches DATA MOD to LAN *after*
@@ -291,9 +285,7 @@ confirmed from a log. Hardening added (`tests/test_reliability.py`):
   touching PTT code.
 - The fake radio follows the real IC-7300MK2 packet order. When the real
   radio shows new behaviour, change the fake to match and add a test.
-- Claude's sandbox has no PyPI access (PySide6, PyAV, sounddevice/PortAudio
-  unavailable): `test_gui` and `test_record_m4a` skip there and must be run
-  by the owner on macOS. Ask for their output.
+- This Mac has a project-local `.venv` with Python 3.14 and the hash-locked dependencies. Use `QT_QPA_PLATFORM=offscreen ICOM_REMOTE_STATE_DIR=/tmp/icom-next-test-state .venv/bin/python tests/ci_run.py` for the CI-style test run. Individual modules can be run with `-m unittest tests.test_gui tests.test_secrets`.
 - Python 3.15 on macOS: `loop.getaddrinfo` failed in the worker thread
   (`'lazy_import' object is not callable`). Workaround in place: resolve with
   `socket.getaddrinfo` in the session thread; `ThreadPoolExecutor` touched at
@@ -303,28 +295,27 @@ confirmed from a log. Hardening added (`tests/test_reliability.py`):
 
 ## Packaging and CI
 
-- `build.py` -> PyInstaller (`icomremote.spec`) -> runs the built app with
+- Build locally with `.venv/bin/python build.py --no-install`. `build.py` -> PyInstaller (`icomremote.spec`) -> runs the built app with
   `--check` -> zip (macOS via `ditto`, keeps signature/symlinks) / zip
   (Windows) / tar.gz (Linux) in `dist/`.
 - `--check` (`__main__.check`) reports Qt, PortAudio, PyAV, resampler,
-  protocol modules; exit 0 = required parts OK. In a windowed build stdout
+  protocol modules and credential backend discovery. `--check-credentials` also writes, reads and deletes one unique temporary secret. For diagnostics use a temporary state directory. Exit 0 = required parts OK. In a windowed build stdout
   is None, so the result goes to the log file too.
 - Built app always logs to `<settings dir>/icomremote.log` (overwritten each
   start). Ask the owner for it when the .app misbehaves.
 - macOS Info.plist needs `NSLocalNetworkUsageDescription` (macOS 15 local
   network privacy) and `NSMicrophoneUsageDescription`; without them access is
-  silently denied. App is unsigned: right-click Open / remove quarantine.
+  silently denied. The build uses PyInstaller ad hoc signing. Finder shows the complete `dist/Icom Remote.app` bundle as one item. Distribute that bundle or its ZIP.
 - `.github/workflows/build.yml`: matrix macos-latest (arm64), windows-latest,
   ubuntu-22.04; Python 3.12; runs the **full** test suite (including GUI and
   M4A tests, offscreen) then `build.py --no-install`; artifacts kept 30 days;
   `v*` tags attach archives to a release. This is the only Windows/Linux
-  testing so far, and it is how Claude can see Windows results: read runs
-  with `gh api repos/jeffreycentex/icom-multiplatform-client/actions/runs`.
+  testing so far, and Windows results can be inspected by reading runs
+  with `gh api repos/jeffreycentex/icom-remote-client-next/actions/runs`.
 - Version: `icomremote/__init__.py` `__version__` (0.9 = tag `v0.9`). Pushing a
   `v*` tag makes the workflow attach the three archives to a GitHub Release.
-- Raw job logs are **not** reachable from Claude's sandbox (blob storage
-  blocked); `tests/ci_run.py` and `build.py` report results as annotations:
-  `gh api repos/jeffreycentex/icom-multiplatform-client/check-runs/<job id>/annotations`.
+- If raw job logs are unavailable, `tests/ci_run.py` and `build.py` report results as annotations:
+  `gh api repos/jeffreycentex/icom-remote-client-next/check-runs/<job id>/annotations`.
 
 ## Lessons from Windows / CI (2026-10-24)
 

@@ -25,6 +25,7 @@ USB/LSB also select DATA (USB-D/LSB-D) unless plain_ssb_is_data is off.
 While disconnected, reads return the last known state and sets fail (RPRT -6).
 """
 
+import ipaddress
 import logging
 import socket
 import socketserver
@@ -32,6 +33,7 @@ import threading
 
 from . import civ
 from .session import PttRefused
+from .network import ManagedConnections
 from .state import HAMLIB_BITS, hamlib_mode, rig_mode_from_hamlib
 
 log = logging.getLogger(__name__)
@@ -90,20 +92,29 @@ def _dump_state(lo_hz, hi_hz):
 
 
 class _Handler(socketserver.StreamRequestHandler):
-    timeout = None
+    timeout = 30.0
 
     def handle(self):
         srv = self.server.owner
         peer = "%s:%s" % self.client_address[:2]
+        with srv._lock:
+            srv._active_clients.add(self)
         srv._client_count(+1, peer)
         try:
-            for raw in self.rfile:
+            while not self.server.closing.is_set():
+                raw = self.rfile.readline(4097)
+                if not raw or len(raw) > 4096:
+                    break
                 try:
                     text = raw.decode("ascii", "replace").strip("\r\n")
                 except Exception:
                     continue
                 if not text.strip():
                     continue
+                # A browser can POST a simple text body to a local TCP port.
+                # Reject the HTTP request line before reading any body as CAT.
+                if "HTTP/" in text:
+                    break
                 reply, close = srv.handle_line(text, client=self)
                 if reply:
                     self.wfile.write(reply.encode("ascii", "replace"))
@@ -117,7 +128,7 @@ class _Handler(socketserver.StreamRequestHandler):
             srv._client_count(-1, peer)
 
 
-class _TCPServer(socketserver.ThreadingTCPServer):
+class _TCPServer(ManagedConnections, socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
@@ -128,19 +139,29 @@ class _TCPServer6(_TCPServer):
 
 class RigctldServer:
     def __init__(self, controller, host="127.0.0.1", port=4532, on_activity=None,
-                 plain_ssb_is_data=True):
+                 plain_ssb_is_data=True, service=None):
         self.controller = controller
+        self.service = service or controller
+        self._active_clients = set()
         self.plain_ssb_is_data = plain_ssb_is_data
+        try:
+            loopback = host == "localhost" or ipaddress.ip_address(host.strip("[]")).is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            raise ValueError("rigctld requires a loopback address; use an authenticated tunnel for remote access")
         self.host = host
         self.port = int(port)
         self._on_activity = on_activity or (lambda kind, payload: None)
         self._server = None
         self._thread = None
+        self._stopped = False
         self._clients = 0
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ lifecycle
     def start(self):
+        self._stopped = False
         cls = _TCPServer6 if ":" in self.host else _TCPServer
         self._server = cls((self.host, self.port), _Handler)
         self._server.owner = self
@@ -150,8 +171,14 @@ class RigctldServer:
         log.info("rigctld listening on %s:%d", self.host, self.port)
 
     def stop(self):
+        self._stopped = True
         if self._server is not None:
+            self._server.close_clients()
             self._server.shutdown()
+            with self._lock:
+                clients = tuple(self._active_clients)
+            for client in clients:
+                self._client_gone(client)
             self._server.server_close()
             self._server = None
             self._thread = None
@@ -166,7 +193,9 @@ class RigctldServer:
 
     def _client_gone(self, client):
         try:
-            self.controller.release_ptt(client)
+            self.service.release_ptt(client)
+            with self._lock:
+                self._active_clients.discard(client)
         except Exception:
             log.exception("releasing PTT failed")
 
@@ -179,6 +208,8 @@ class RigctldServer:
     # ------------------------------------------------------------------ protocol
     def handle_line(self, line, client=None):
         """Process one input line (may hold several short commands). Returns (reply, close)."""
+        if self._stopped or (self._server is not None and self._server.closing.is_set()):
+            return "RPRT -6\n", True
         line = line.strip()
         extended = False
         sep = "\n"
@@ -258,8 +289,8 @@ class RigctldServer:
             if not c.connected or c.power != "on":
                 return [], E_IO
             try:
-                c.set_frequency(hz)
-            except ValueError as e:
+                self.service.set_frequency(hz)
+            except (ValueError, PttRefused) as e:
                 log.info("rigctl: %s", e)
                 return [], E_INVAL
             self._on_activity("command", "F %.0f" % hz)
@@ -279,7 +310,7 @@ class RigctldServer:
             if not c.connected or c.power != "on":
                 return [], E_IO
             if (st.mode, st.data) != want:          # passband ignored: keep the radio's filter
-                c.set_mode(want[0], want[1])
+                self.service.set_mode(want[0], want[1])
             self._on_activity("command", "M %s" % args[0])
             return [], 0
         if cmd == "get_vfo":
@@ -287,7 +318,7 @@ class RigctldServer:
         if cmd == "set_ptt":
             on = bool(args) and args[0] != "0"
             try:
-                c.set_ptt(on, owner=client)
+                self.service.set_ptt(on, owner=client)
             except PttRefused as e:
                 log.info("rigctl: %s", e)
                 self._on_activity("refused", str(e))

@@ -1,3 +1,118 @@
+# Icom Remote Next — local architecture revision
+
+Icom Remote Next is a separate revision of the Icom multiplatform client.
+It preserves the RS-BA1 protocol and adds a tabbed GUI, safer control and
+recording, and native credential storage.
+
+## Run this version
+
+On this Mac, double-click **Launch Icom Remote Next.command**. Its dedicated
+`.venv` is installed in this directory. To set up another machine:
+
+```sh
+python -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.lock
+.venv/bin/python run_icomremote.py
+```
+
+On Windows, use `.venv\Scripts\python` for the interpreter. Settings and
+restore records use the separate **IcomRemoteNext** identity. The radio wire
+protocol and command-line entry points remain compatible. Close the original
+client before connecting this version to the same radio or using the same
+local CAT/API ports.
+
+## Interface
+
+- **Radio:** connection, tuning, signal meter, preset-frequency buttons,
+  DATA PTT, voice arming, RF power, tuner and transmit meters. Import a file
+  with **Import presets…**; each line is `name, frequency in kHz`, as in
+  `40m FT8, 7074`. Up to ten buttons stay on this main page. The selected file
+  is remembered and watched for changes.
+- **Audio:** receive and transmit devices, gain, and DATA MOD / DATA OFF MOD
+  routing and restoration settings.
+- **Recording and control:** recording format/folder, CAT and HTTP controls.
+  All tabs use the same light palette and fit their controls without scroll bars.
+- Moving away from Radio releases the held Space PTT and disarms voice PTT.
+  Voice is also disarmed on disconnect; a hidden tab cannot key the radio.
+
+## Ownership and safety
+
+The GUI and rigctld send mutations through `IcomService`, the same boundary
+used by HTTP. A bounded command worker serializes ordinary mutations.
+PTT requests go directly from that service to the radio's session event loop,
+so a recording drain cannot delay key-up. The loop owns desired PTT, the
+current owner, actual keying, and timeout. A second caller cannot take over an
+active owner's key-down, and repeat presses never extend its original cutoff.
+A mode/frequency/filter service request is validated and applied together on
+that loop, and is refused during transmit or antenna tuning.
+
+The servers track active sockets, cap simultaneous clients and apply read
+timeouts. Turning a server off closes its clients as well as its listener;
+CAT shutdown releases the clients' PTT. CAT is restricted to loopback; use an
+authenticated tunnel for remote access. HTTP retains its Host, token and
+JSON/CORS protections, validates body lengths and rejects non-finite numbers.
+RS-BA1 itself still uses the radio's reversible credential obfuscation: use a
+trusted network or encrypted tunnel for that connection.
+
+Recording uses a bounded FIFO writer thread, separate from the radio loop.
+Stopping drains accepted audio and finalizes its container. If storage stalls
+and fills the queue, recording stops with an explicit error; queued audio is
+drained and finalized when storage recovers. A close that remains blocked for
+15 seconds reports pending finalization rather than claiming success. Long
+reconnect gaps are queued as compact silence requests. WAV and AAC/MP4 files,
+including rollover segments, are reserved with exclusive creation: existing
+files and symlinks are never overwritten. Recording-name templates accept only
+bounded simple named placeholders; format-width expansion is rejected.
+
+The header always shows **CONNECTED**, **CONNECTING**, **DISCONNECTED**, or a
+red failure state. Failure details remain visible across tabs and automatic
+retries, including after a bad login stops the worker. A successful connection
+clears the failure banner.
+
+Select **Remember password securely** to save immediately; later password edits
+are saved when you leave the field. Use **Save token securely** beside the API
+token. Each field shows persistent saved/load/error feedback. Clear the token
+and save to delete it; uncheck Remember to remove the saved password.
+
+Windows uses Windows Credential Manager. Linux uses Secret Service (for example,
+GNOME Keyring), KWallet, or libsecret when available in the desktop session.
+KWallet may require the distribution's dbus-python integration. A locked or
+missing store produces an explicit error and keeps entered secrets in memory.
+Backend chains are filtered to native providers; plaintext fallback providers
+are rejected. Linux and Windows provider selection is covered with simulated
+backends; native integration has been verified on this Mac only.
+
+Passwords and API tokens are never saved in ordinary Qt settings. Remembered
+secrets use a native OS credential store through `keyring`. If a native store
+is unavailable or locked, the app retains entered secrets in memory only and
+reports that it could not save them. This local version does not import the
+original client's saved credentials.
+
+## Development and tests
+
+```sh
+ICOM_REMOTE_STATE_DIR=/tmp/icom-next-test-state QT_QPA_PLATFORM=offscreen \
+  .venv/bin/python -m unittest discover -s tests -v
+```
+
+The state-directory override keeps fake-radio restore records out of your
+normal configuration. Tests use temporary files and fake radios, including
+simulated slow storage, shutdown of live connections, repeated PTT, competing
+PTT owners and tab placement/disarming. Live radio checks should be receive-only
+unless transmitting has explicitly been authorized.
+
+Dependencies have a cross-platform lock with exact versions and package hashes.
+CI actions are pinned to immutable commit hashes. Update the lock with
+`uv pip compile --universal --python-version 3.12 --generate-hashes requirements-build.in -o requirements.lock`.
+The build workflow grants write permissions only to a separate release job,
+and release publishing depends on successful tests and builds on all platforms.
+
+---
+
+The upstream README follows for hardware setup and protocol details. Its GUI
+layout, plaintext-password and remote CAT-binding descriptions are superseded
+by the local-version notes above.
+
 # Icom Remote (multiplatform RS-BA1 client)
 
 A cross-platform (Windows / macOS / Linux) desktop client for Icom's RS-BA1 LAN
@@ -301,26 +416,10 @@ Transmit stops (PTT released) when:
 Audio is only sent to the radio while PTT is on. The **TX/RX** indicator shows
 what the radio reports, not just what was requested.
 
-### Power ON / OFF
+### Standby
 
-The button next to the radio info reads **Power OFF** when the radio is on and
-**Power ON** when it is in standby.
-
-- **Power OFF** asks for confirmation, stops any transmission or tune, puts
-  DATA MOD / DATA OFF MOD back, then switches the radio off.
-- **Power ON** sends the CI-V power-on command and waits up to 25 s for the
-  radio to answer. Then DATA MOD / DATA OFF MOD are switched to LAN again.
-- While the radio is in standby the app stays connected to its network
-  server; tuning and transmit controls are disabled. Switching the radio off
-  or on at the radio is noticed within a few seconds.
-- On the IC-7300MK2 the radio's network stays up after Power OFF (verified,
-  with its *Power OFF Setting (for Remote Control)* on *Shutdown only*), and
-  Power ON over the LAN brings it back in about 4 s. You can also connect to
-  a radio that is already off and switch it on from here.
-- If a radio's network goes down with it (e.g. an IC-705 on Wi-Fi), the app
-  reports that the radio stopped responding; switch it on at the radio.
-- rigctl `get_powerstat` reports on (1) / standby (2); `set_powerstat` is
-  accepted and ignored: programs don't switch the radio on or off.
+Use the radio’s power switch. When the network stays up in standby, the client
+shows **STANDBY** and disables tuning and transmit controls.
 
 ### RF power and TUNE
 

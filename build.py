@@ -99,7 +99,7 @@ def main():
         print("WARNING: not running in a virtual environment; the build will bundle whatever "
               "is installed globally.")
     if not args.no_install:
-        run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "pyinstaller"], check=True)
+        run([sys.executable, "-m", "pip", "install", "--require-hashes", "-r", "requirements.lock"], check=True)
     env = dict(os.environ)
     if args.console:
         env["ICOMREMOTE_CONSOLE"] = "1"

@@ -1,25 +1,22 @@
-"""Qt-free application service for the remote-control API: tuning, recording
-and status on top of RadioSession. The GUI records through this class too, so
-whatever the API does the window shows, and the other way round.
+"""Qt-free control boundary shared by the window, rigctld and HTTP API.
 
-Adapted from kiwisdr-remote's KiwiService. Connecting stays in the GUI (the
-API has no /connect here): the radio's address and login are the owner's.
-
-Control only: no PTT endpoint, and nothing here restricts transmitting from
-the GUI or rigctld. The one interaction is the other way round: /tune is
-refused while the radio is keyed or tuning (checked and applied under the
-session's PTT lock, held only for that moment, so a key-down can't slip in
-between).
+Ordinary mutations use one bounded command owner. Transmit safety requests
+submit straight to the radio event loop so a disk drain cannot delay key-up.
+Tune validation and application are atomic on that same radio loop. Worker
+events remain observational and never synchronously call this service.
 """
 
 import logging
+import math
+import string
 import os
 import re
 import threading
 import time
 
 from . import __version__, civ
-from .session import NotConnected, RadioSession
+from .session import NotConnected, PttRefused, RadioSession
+from .commands import CommandQueue, command
 from .state import rig_mode_from_hamlib, ui_label
 
 log = logging.getLogger(__name__)
@@ -54,6 +51,8 @@ def default_record_dir():
 class IcomService:
     def __init__(self, on_event=None, state_dir=None, record_dir=None, clock=time.monotonic,
                  start_ticker=True):
+        self._commands = CommandQueue()
+        self._shutdown_done = False
         self.radio = RadioSession(on_event=on_event, state_dir=state_dir)
         self.record_dir = record_dir or default_record_dir()
         self.plain_ssb_is_data = True      # same rule as rigctl: plain USB/LSB -> USB-D/LSB-D
@@ -67,7 +66,79 @@ class IcomService:
             self._ticker = threading.Thread(target=self._tick_loop, name="icom-service", daemon=True)
             self._ticker.start()
 
+    @command
+    def connect(self, spec):
+        return self.radio.connect(spec)
+
+    @command
+    def disconnect(self):
+        return self.radio.disconnect()
+
+    @command
+    def set_frequency(self, hz):
+        return self.radio.control_tune(freq_hz=hz)
+
+    @command
+    def set_mode(self, mode, data, filt=None):
+        return self.radio.control_tune(mode=mode, data=data, filt=filt)
+
+    @command
+    def set_filter(self, filt):
+        return self.radio.control_tune(filt=filt)
+
+    def set_ptt(self, on, owner=None, reason=None, voice_ok=False):
+        # Safety controls go straight to the session owner, never behind a disk drain.
+        return self.radio.set_ptt(on, owner=owner, reason=reason, voice_ok=voice_ok)
+
+    def release_ptt(self, owner, reason=None):
+        return self.radio.release_ptt(owner, reason=reason)
+
+    @command
+    def set_rf_power(self, percent):
+        return self.radio.set_rf_power(percent)
+
+    @command
+    def set_audio_device(self, device_key, gain=1.0):
+        return self.radio.set_audio_device(device_key, gain)
+
+    @command
+    def set_tx_device(self, device_key, gain=1.0, kind="data"):
+        return self.radio.set_tx_device(device_key, gain, kind)
+
+    @command
+    def set_tx_gain(self, gain, kind="data"):
+        return self.radio.set_tx_gain(gain, kind)
+
+    @command
+    def power_on(self):
+        return self.radio.power_on()
+
+    @command
+    def power_off(self):
+        return self.radio.power_off()
+
+    @command
+    def start_tuner(self):
+        return self.radio.tune()
+
+    @command
+    def restore_data_mod_now(self):
+        return self.radio.restore_data_mod_now()
+
+    @command
+    def configure_transmit(self, *, timeout=None, manage_data_mod=None, manage_data_off_mod=None):
+        if timeout is not None:
+            value = float(timeout)
+            if not math.isfinite(value) or not 10 <= value <= 600:
+                raise ValueError("PTT timeout must be between 10 and 600 seconds")
+            self.radio.ptt_timeout = value
+        for key, value in (("manage_data_mod", manage_data_mod),
+                           ("manage_data_off_mod", manage_data_off_mod)):
+            if value is not None:
+                setattr(self.radio, key, bool(value))
+
     # ------------------------------------------------------------------ tuning
+    @command
     def tune(self, freq_hz=None, mode=None, passband=None):
         """Set frequency and/or mode. passband is accepted and ignored: the
         radio keeps its selected filter (FIL1/2/3), as with rigctl."""
@@ -82,25 +153,14 @@ class IcomService:
             if not lo <= freq_hz <= hi:
                 raise ApiError("bad_request", "%.3f kHz is outside %.0f-%.0f kHz"
                                % (freq_hz / 1e3, lo / 1e3, hi / 1e3))
-        with r._ptt_lock:                    # no key-down between this check and the change
-            if not r.connected:
-                raise ApiError("not_connected", "not connected to the radio (connect in the Icom Remote "
-                                                "window)", 409)
-            if r.power != "on":
-                raise ApiError("not_connected", "the radio is not powered on", 409)
-            if r.ptt or r.tx or r._keyed or r._keying:
-                raise ApiError("transmitting", "the radio is transmitting", 409)
-            if r._tuning or r.tuner == civ.TUNER_TUNING:
-                raise ApiError("transmitting", "the antenna tuner is tuning", 409)
-            try:
-                if want is not None and (r.rig.mode, r.rig.data) != want:
-                    r.set_mode(want[0], want[1])
-                if freq_hz is not None:
-                    r.set_frequency(freq_hz)
-            except NotConnected as e:
-                raise ApiError("not_connected", str(e), 409)
-            except ValueError as e:
-                raise ApiError("bad_request", str(e))
+        try:
+            r.control_tune(freq_hz, *(want or (None, None)))
+        except NotConnected as e:
+            raise ApiError("not_connected", str(e), 409) from e
+        except PttRefused as e:
+            raise ApiError("transmitting", str(e), 409) from e
+        except ValueError as e:
+            raise ApiError("bad_request", str(e)) from e
         return self.tune_info()
 
     def tune_info(self):
@@ -134,7 +194,15 @@ class IcomService:
                 "server": spec.host if spec else "none",
             }
             try:
-                base = (name or DEFAULT_NAME).format(**fields)
+                template = name or DEFAULT_NAME
+                if len(template) > 240:
+                    raise ValueError("name template is too long")
+                for _, field, spec, conversion in string.Formatter().parse(template):
+                    if field is not None and (field not in fields or spec or conversion):
+                        raise ValueError("use simple named placeholders only")
+                base = template.format(**fields)
+                if len(base.encode("utf-8")) > 240:
+                    raise ValueError("expanded name is too long")
             except (KeyError, IndexError, ValueError) as e:
                 raise ApiError("bad_request", "bad name template (fields: %s): %s"
                                % (", ".join(sorted(fields)), e))
@@ -144,16 +212,17 @@ class IcomService:
             path = os.path.join(directory, _safe(base) + ext)
         root, e = os.path.splitext(path)
         n = 1
-        while os.path.exists(path):            # never overwrite an earlier recording
+        while os.path.lexists(path):            # never overwrite an earlier recording
             path = "%s_%d%s" % (root, n, e)
             n += 1
         return path
 
+    @command
     def start_recording(self, path=None, directory=None, name=None, max_seconds=None,
                         ext=".wav", formats=(".wav",)):
         """The API records WAV only; the GUI passes formats to also allow .m4a/.mp4."""
         if max_seconds is not None and (isinstance(max_seconds, bool) or
-                                        not isinstance(max_seconds, (int, float)) or max_seconds <= 0):
+                                        not isinstance(max_seconds, (int, float)) or not math.isfinite(max_seconds) or max_seconds <= 0):
             raise ApiError("bad_request", "max_seconds must be a number > 0")
         with self._lock:
             if self.radio.recording_path() is not None:
@@ -172,6 +241,7 @@ class IcomService:
                  " (stops after %.0f s)" % self._rec_max if self._rec_max else "")
         return self.recording_info()
 
+    @command
     def stop_recording(self, reason="requested"):
         with self._lock:
             self._rec_deadline = self._rec_max = None
@@ -239,19 +309,33 @@ class IcomService:
             except Exception:
                 log.exception("service tick failed")
 
+    @command
     def tick(self):
         """Stop a recording that reached its max_seconds."""
         with self._lock:
             due = self._rec_deadline is not None and self._clock() >= self._rec_deadline
+            if due:
+                info = self.stop_recording(reason="max_seconds")
         if due:
-            info = self.stop_recording(reason="max_seconds")
             self.radio._status("Recording reached its maximum length%s"
                                % (": %s" % os.path.basename(info["path"]) if info else ""))
 
     # ------------------------------------------------------------------ lifecycle
     def shutdown(self):
+        if self._shutdown_done:
+            return
         self._stop.set()
-        self.stop_recording(reason="shutdown")
-        self.radio.shutdown()
-        if self._ticker is not None:
-            self._ticker.join(2.0)
+        try:
+            self._shutdown()
+        finally:
+            self._commands.close()
+            self._shutdown_done = True
+            if self._ticker is not None:
+                self._ticker.join(2.0)
+
+    @command
+    def _shutdown(self):
+        try:
+            self.stop_recording(reason="shutdown")
+        finally:
+            self.radio.shutdown()

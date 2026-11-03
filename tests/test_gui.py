@@ -61,6 +61,124 @@ class TestGui(unittest.TestCase):
             time.sleep(0.02)
         return False
 
+    def test_operating_controls_stay_on_main_tab(self):
+        radio_page = self.w.tabs.widget(0)
+        audio_page = self.w.tabs.widget(1)
+        for control in (self.w.freq, self.w.ptt_btn, self.w.voice_arm,
+                        self.w.import_freq_btn, *self.w.quicktune_buttons):
+            self.assertTrue(radio_page.isAncestorOf(control))
+        for control in (self.w.device_combo, self.w.tx_combo, self.w.tx_gain):
+            self.assertTrue(audio_page.isAncestorOf(control))
+
+    def test_switching_tabs_releases_and_disarms_voice(self):
+        from unittest.mock import patch
+        self.w.voice_arm.setEnabled(True)
+        self.w.voice_arm.setChecked(True)
+        self.w._space_down = True
+        with patch.object(self.w.service, "release_ptt") as release:
+            self.w.tabs.setCurrentIndex(1)
+            release.assert_called_once_with(self.w._space_owner, reason=None)
+        self.assertFalse(self.w.voice_arm.isChecked())
+        self.assertFalse(self.w._space_down)
+
+    def test_failed_secret_storage_never_writes_plaintext(self):
+        from unittest.mock import patch
+        self.w.password.setText("test-secret-value")
+        self.w.api_token.setText("test-api-token")
+        with patch.object(self.w.secrets, "set", side_effect=RuntimeError("locked")):
+            self.w.remember_pw.setChecked(True)
+            self.w._save_settings()
+        self.w.settings.sync()
+        self.assertIsNone(self.w.settings.value("password"))
+        self.assertIsNone(self.w.settings.value("api_token"))
+        with open(self.w.settings.fileName(), encoding="utf-8") as file:
+            saved = file.read()
+        self.assertNotIn("test-secret-value", saved)
+        self.assertNotIn("test-api-token", saved)
+        self.w.password.clear()
+        self.w.api_token.clear()
+        self.w.remember_pw.setChecked(False)
+
+    def test_unread_saved_secret_is_not_deleted_on_close(self):
+        from unittest.mock import patch
+        self.w.settings.setValue("password_secret_id", "existing-password-reference")
+        self.w._unread_secrets.add("password")
+        self.w.password.clear()
+        with patch.object(self.w.secrets, "delete") as delete:
+            self.w._save_settings()
+            delete.assert_not_called()
+        self.assertEqual(self.w.settings.value("password_secret_id"), "existing-password-reference")
+        self.w.settings.remove("password_secret_id")
+        self.w._unread_secrets.clear()
+
+    def test_connection_failure_remains_visible_after_stopped(self):
+        from unittest.mock import patch
+        from icomremote.session import ConnectionSpec
+        p = self.radio.ports
+        self.w.service.connect(ConnectionSpec("127.0.0.1", "beer", "wrong", p["control"], p["serial"], p["audio"]))
+        self.assertTrue(self.pump_until(lambda: self.w.radio.failed and not self.w.radio.running))
+        self.w._tick()
+        self.assertEqual(self.w.state_badge.text(), "CONNECTION FAILED")
+        self.assertTrue(self.w.connection_error.isVisible())
+        self.assertIn("password", self.w.connection_error.text().lower())
+        self.assertEqual(self.w.connect_btn.text(), "Connect")
+        self.w.tabs.setCurrentIndex(1)
+        self.assertTrue(self.w.connection_error.isVisible())
+        self.assertEqual(self.w.state_badge.text(), "CONNECTION FAILED")
+
+    def test_connected_badge_and_disconnect(self):
+        from icomremote.session import ConnectionSpec
+        p = self.radio.ports
+        self.w.service.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer", p["control"], p["serial"], p["audio"]))
+        self.assertTrue(self.pump_until(lambda: self.w.state_badge.text() == "CONNECTED"))
+        self.assertFalse(self.w.connection_error.isVisible())
+        self.w._connect_clicked()
+        self.assertTrue(self.pump_until(lambda: self.w.state_badge.text() == "DISCONNECTED"))
+
+    def test_password_and_token_saved_immediately_and_restored(self):
+        from icomremote.secrets import SecretStore
+        from icomremote.gui import MainWindow
+        from unittest.mock import patch
+        values = {}
+        store = SecretStore()
+        with patch.object(store, "set", side_effect=lambda key, value: values.__setitem__(key, value)), \
+             patch.object(store, "get", side_effect=lambda key: values.get(key, "")), \
+             patch.object(store, "delete", side_effect=lambda key: values.pop(key, None)):
+            self.w.secrets = store
+            self.w.host.setText("test-radio")
+            self.w.user.setText("test-user")
+            self.w.password.setText("fixture-password")
+            self.w.remember_pw.setChecked(True)
+            password_id = self.w.settings.value("password_secret_id")
+            self.assertEqual(values[password_id], "fixture-password")
+            self.assertIn("saved securely", self.w.password_status.text())
+            self.w.api_token.setText("fixture-token")
+            self.w.save_token_btn.click()
+            token_id = self.w.settings.value("api_token_secret_id")
+            self.assertEqual(values[token_id], "fixture-token")
+            self.assertIn("saved securely", self.w.token_status.text())
+            self.w._save_settings()
+            self.w.settings.sync()
+            with patch("icomremote.gui.SecretStore", return_value=store):
+                other = MainWindow(settings=QSettings(self.w.settings.fileName(), QSettings.IniFormat), quicktune_path=self.quicktune)
+            try:
+                self.assertEqual(other.password.text(), "fixture-password")
+                self.assertEqual(other.api_token.text(), "fixture-token")
+                self.assertIn("loaded securely", other.password_status.text())
+                self.assertIn("loaded securely", other.token_status.text())
+            finally:
+                other.close()
+                other.deleteLater()
+            self.w.remember_pw.setChecked(False)
+            self.assertNotIn(password_id, values)
+            self.w.api_token.clear()
+            self.w._persist_api_token()
+            self.assertNotIn(token_id, values)
+            with open(self.w.settings.fileName(), encoding="utf-8") as file:
+                contents = file.read()
+            self.assertNotIn("fixture-password", contents)
+            self.assertNotIn("fixture-token", contents)
+
     def test_connect_and_control(self):
         w = self.w
         self.assertFalse(w.freq.isEnabled())               # disabled until connected
@@ -134,23 +252,6 @@ class TestGui(unittest.TestCase):
         self.assertTrue(self.pump_until(lambda: self.radio.tuner == 2 and "tuning" in w.tuner_label.text()))
         self.assertFalse(w.tune_btn.isEnabled())
         self.assertTrue(self.pump_until(lambda: w.tuner_label.text() == "Tuner: on" and w.tune_btn.isEnabled()))
-
-        # ---- power off / on
-        from PySide6.QtWidgets import QMessageBox
-        self.assertEqual(w.power_btn.text(), "Power OFF")
-        asked = []
-        orig = QMessageBox.question
-        QMessageBox.question = staticmethod(lambda *a, **k: (asked.append(a[2]), QMessageBox.Yes)[1])
-        try:
-            w.power_btn.click()
-        finally:
-            QMessageBox.question = orig
-        self.assertIn("switched on again from here", asked[0])
-        self.assertTrue(self.pump_until(lambda: not self.radio.powered and w.power_btn.text() == "Power ON"))
-        self.assertFalse(w.freq.isEnabled())                 # controls off in standby
-        self.assertEqual(self.radio.menu[b"\x00\x85"], 0x01)   # DATA MOD put back before power-off
-        w.power_btn.click()
-        self.assertTrue(self.pump_until(lambda: w.power_btn.text() == "Power OFF" and w.freq.isEnabled(), 10))
 
         w._connect_clicked()                                # Disconnect
         self.assertTrue(self.pump_until(lambda: not w.freq.isEnabled()
