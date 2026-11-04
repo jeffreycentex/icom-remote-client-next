@@ -11,14 +11,13 @@ from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabWidget, QVBoxLayout, QWidget)
+    QSlider, QSpinBox, QStatusBar, QTabWidget, QVBoxLayout, QWidget)
 
 from . import __version__, civ, quicktune
 from .api import DEFAULT_PORT as API_DEFAULT_PORT, ApiServer
 from .rigctld import RigctldServer
 from .service import ApiError, IcomService, default_record_dir
 from .session import ConnectionSpec, NotConnected, PttRefused
-from .secrets import SecretStore
 from .sinks import (HAVE_PYAV, HAVE_SOUNDDEVICE, PULSE_PREFIX, create_null_sink,
                     guess_virtual_cable, list_output_devices, sounddevice_error)
 from .state import BASE_MODES, FILTERS, PROFILES
@@ -86,9 +85,6 @@ class MainWindow(QMainWindow):
                                    border: 1px solid #cbd3df; border-radius: 4px; }
         """)
         self.settings = settings if settings is not None else QSettings("IcomRemoteNext", "Icom Remote Next")
-        self.secrets = SecretStore()
-        self._saved_secret_values = {}
-        self._unread_secrets = set()
         self._last_connection_error = None
         self._connection_cancelled = False
         self._connection_visual_state = None
@@ -152,11 +148,7 @@ class MainWindow(QMainWindow):
         self.resize(740, 760)
         self.setMinimumSize(560, 460)
         bottom = QHBoxLayout()
-        self.credential_footer = QStackedWidget()
-        self.credential_footer.addWidget(self.password_status)
-        self.credential_footer.addWidget(self.token_status)
-        self.credential_footer.setFixedHeight(2 * self.password_status.fontMetrics().lineSpacing())
-        bottom.addWidget(self.credential_footer, 1)
+        bottom.addStretch(1)
         exit_btn = QPushButton("Exit")
         exit_btn.setToolTip("Disconnect and close the application")
         exit_btn.clicked.connect(self.close)          # closeEvent saves settings and shuts down
@@ -166,11 +158,6 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
         self._load_settings()
-        self.remember_pw.toggled.connect(self._remember_password_changed)
-        self.password.editingFinished.connect(self._persist_password)
-        self.password.textEdited.connect(lambda _: self._unread_secrets.discard("password"))
-        self.api_token.textEdited.connect(lambda _: self._unread_secrets.discard("api_token"))
-        self.api_token.editingFinished.connect(self._persist_api_token)
         self._refresh_connection_state()
         self._check_quicktune()
         self._set_controls_enabled(False)
@@ -195,8 +182,8 @@ class MainWindow(QMainWindow):
         self.user = QLineEdit(placeholderText="network user name set in the radio")
         self.password = QLineEdit(echoMode=QLineEdit.Password)
         self.password.returnPressed.connect(self._connect_clicked)
-        self.remember_pw = QCheckBox("Remember password securely")
-        self.remember_pw.setToolTip("Stored in the operating system credential manager; never in app settings")
+        self.remember_pw = QCheckBox("Remember password")
+        self.remember_pw.setToolTip("Stored unencrypted in this computer's settings for the app")
         self.profile = QComboBox()
         for label, addr in PROFILES.items():
             self.profile.addItem(label, addr)
@@ -206,7 +193,6 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self._connect_clicked)
         self.conn_label = QLabel("Disconnected", wordWrap=True)
         self.conn_label.setTextFormat(Qt.PlainText)
-        self.password_status = QLabel(wordWrap=True)
         self.info_label = QLabel("")
         self.info_label.setStyleSheet("color: #526176")
         self.smeter = QProgressBar(minimum=0, maximum=S_MAX_RAW, textVisible=True)
@@ -561,15 +547,11 @@ class MainWindow(QMainWindow):
         self.api_port = QSpinBox(minimum=1, maximum=65535, value=API_DEFAULT_PORT)
         self.api_token = QLineEdit(echoMode=QLineEdit.Password, placeholderText="token (optional)")
         self.api_status = QLabel("Off")
-        self.token_status = QLabel(wordWrap=True)
-        self.save_token_btn = QPushButton("Save token securely")
-        self.save_token_btn.clicked.connect(self._persist_api_token)
         g.addWidget(self.api_enable, 0, 0)
         g.addWidget(QLabel("Port"), 0, 1)
         g.addWidget(self.api_port, 0, 2)
         g.addWidget(self.api_token, 0, 3)
         g.addWidget(self.api_status, 1, 0, 1, 4)
-        g.addWidget(self.save_token_btn, 2, 3)
         g.setColumnStretch(3, 1)
         return box
 
@@ -581,8 +563,7 @@ class MainWindow(QMainWindow):
         remember = s.value("remember_pw", False, type=bool)
         self.remember_pw.setChecked(remember)
         if remember:
-            self.password.setText(self._load_secret("password"))
-        s.remove("password")
+            self.password.setText(s.value("password", ""))
         i = self.profile.findText(s.value("profile", ""))
         self.profile.setCurrentIndex(i if i >= 0 else 0)
         idx = self.step.findData(s.value("step", 1000, type=int))
@@ -611,8 +592,7 @@ class MainWindow(QMainWindow):
         self.rig_plain_data.setChecked(s.value("rig_plain_data", True, type=bool))
         self.service.plain_ssb_is_data = self.rig_plain_data.isChecked()
         self.api_port.setValue(s.value("api_port", API_DEFAULT_PORT, type=int))
-        self.api_token.setText(self._load_secret("api_token"))
-        s.remove("api_token")
+        self.api_token.setText(s.value("api_token", ""))
         self.api_enable.blockSignals(True)
         self.api_enable.setChecked(s.value("api_enable", False, type=bool))
         self.api_enable.blockSignals(False)
@@ -625,102 +605,15 @@ class MainWindow(QMainWindow):
         if s.value("audio_enable", False, type=bool) and self.device_combo.currentData():
             self.audio_enable.setChecked(True)
 
-    def _credential_feedback(self, key, message, error=False):
-        label = self.password_status if key == "password" else self.token_status
-        label.setText(message)
-        label.setToolTip(message)
-        label.setStyleSheet("color: #991b1b" if error else "color: #166534")
-        if error:
-            self.statusBar().showMessage(message, 10000)
-
-    def _secret_identifier(self, key):
-        parts = [self.settings.fileName(), key]
-        if key == "password":
-            parts.extend((self.host.text().strip(), self.user.text().strip()))
-        return self.secrets.identifier(*parts)
-
-    def _load_secret(self, key):
-        legacy = self.settings.value(key, "")
-        identifier = self.settings.value(key + "_secret_id", "")
-        if not identifier:
-            return legacy
-        label = "Password" if key == "password" else "API token"
-        try:
-            value = self.secrets.get(identifier)
-            if value:
-                self._saved_secret_values[key] = (identifier, value)
-                self._credential_feedback(key, label + " loaded securely from " + self.secrets.display_name + ".")
-            else:
-                self._unread_secrets.add(key)
-                self._credential_feedback(key, label + " was not found in " + self.secrets.display_name + "; enter and save it again.", True)
-            return value
-        except Exception:
-            self._unread_secrets.add(key)
-            self._credential_feedback(key, "Could not read " + label.lower() + " from " + self.secrets.display_name + ". Unlock or allow access to the credential store and try again.", True)
-            return ""
-
-    def _save_secret(self, key, value):
-        previous = self.settings.value(key + "_secret_id", "")
-        label = "Password" if key == "password" else "API token"
-        if not value and key in self._unread_secrets:
-            return False  # a failed read must never erase an existing secret on exit
-        if not value and not previous:
-            self._credential_feedback(key, "")
-            return True
-        identifier = self._secret_identifier(key)
-        if value and self._saved_secret_values.get(key) == (identifier, value):
-            self._credential_feedback(key, label + " saved securely in " + self.secrets.display_name + ".")
-            return True
-        try:
-            if value:
-                self.secrets.set(identifier, value)
-            if previous and (not value or previous != identifier):
-                self.secrets.delete(previous)
-        except Exception as exc:
-            log.warning("Credential store operation failed for %s: %s", key, type(exc).__name__)
-            action = "save " if value else "remove "
-            self._credential_feedback(key, "Could not " + action + label.lower() + " in " + self.secrets.display_name + ". Check access and try again.", True)
-            return False
-        self._unread_secrets.discard(key)
-        if value:
-            self.settings.setValue(key + "_secret_id", identifier)
-            self._saved_secret_values[key] = (identifier, value)
-            self._credential_feedback(key, label + " saved securely in " + self.secrets.display_name + ".")
-        else:
-            self.settings.remove(key + "_secret_id")
-            self._saved_secret_values.pop(key, None)
-            self._credential_feedback(key, label + " removed from " + self.secrets.display_name + ".")
-        self.settings.sync()
-        return True
-
-    @Slot(bool)
-    def _remember_password_changed(self, checked):
-        if not checked:
-            self._unread_secrets.discard("password")
-        self.settings.setValue("remember_pw", checked)
-        self._persist_password()
-
-    def _persist_password(self):
-        self.settings.setValue("host", self.host.text().strip())
-        self.settings.setValue("user", self.user.text().strip())
-        self.settings.setValue("remember_pw", self.remember_pw.isChecked())
-        self._save_secret("password", self.password.text() if self.remember_pw.isChecked() else "")
-        self.settings.remove("password")
-        self.settings.sync()
-
-    @Slot()
-    def _persist_api_token(self):
-        self._save_secret("api_token", self.api_token.text())
-        self.settings.remove("api_token")
-        self.settings.sync()
-
     def _save_settings(self):
         s = self.settings
         s.setValue("host", self.host.text().strip())
         s.setValue("user", self.user.text().strip())
         s.setValue("remember_pw", self.remember_pw.isChecked())
-        self._save_secret("password", self.password.text() if self.remember_pw.isChecked() else "")
-        s.remove("password")
+        if self.remember_pw.isChecked():
+            s.setValue("password", self.password.text())
+        else:
+            s.remove("password")
         s.setValue("profile", self.profile.currentText())
         s.setValue("step", self.step.currentData())
         s.setValue("audio_device", self.device_combo.currentData() or "")
@@ -740,8 +633,7 @@ class MainWindow(QMainWindow):
         s.setValue("rig_plain_data", self.rig_plain_data.isChecked())
         s.setValue("api_enable", self.api_enable.isChecked())
         s.setValue("api_port", self.api_port.value())
-        self._save_secret("api_token", self.api_token.text())
-        s.remove("api_token")
+        s.setValue("api_token", self.api_token.text())
         s.setValue("geometry2", self.saveGeometry())
         s.setValue("quicktune_path", self.quicktune_path)
         s.sync()
@@ -1141,7 +1033,6 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _tab_changed(self, index):
-        self.credential_footer.setCurrentIndex(1 if index == 2 else 0)
         if index != 0:
             self._space_release()
             self.voice_arm.setChecked(False)

@@ -2,7 +2,7 @@
 
 Icom Remote Next is a separate revision of the Icom multiplatform client.
 It preserves the RS-BA1 protocol and adds a tabbed GUI, safer control and
-recording, and native credential storage.
+and recording.
 
 ## Run this version
 
@@ -69,24 +69,10 @@ red failure state. Failure details remain visible across tabs and automatic
 retries, including after a bad login stops the worker. A successful connection
 clears the failure banner.
 
-Select **Remember password securely** to save immediately; later password edits
-are saved when you leave the field. Use **Save token securely** beside the API
-token. Each field shows persistent saved/load/error feedback. Clear the token
-and save to delete it; uncheck Remember to remove the saved password.
-
-Windows uses Windows Credential Manager. Linux uses Secret Service (for example,
-GNOME Keyring), KWallet, or libsecret when available in the desktop session.
-KWallet may require the distribution's dbus-python integration. A locked or
-missing store produces an explicit error and keeps entered secrets in memory.
-Backend chains are filtered to native providers; plaintext fallback providers
-are rejected. Linux and Windows provider selection is covered with simulated
-backends; native integration has been verified on this Mac only.
-
-Passwords and API tokens are never saved in ordinary Qt settings. Remembered
-secrets use a native OS credential store through `keyring`. If a native store
-is unavailable or locked, the app retains entered secrets in memory only and
-reports that it could not save them. This local version does not import the
-original client's saved credentials.
+The app saves settings on exit. Select **Remember password** to save the radio
+password, or clear the checkbox to remove it. The API token is saved with the
+other settings. Both values are stored unencrypted in local app settings.
+Re-enter values previously saved only in the operating system credential store.
 
 ## Development and tests
 
