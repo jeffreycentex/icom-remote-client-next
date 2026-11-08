@@ -5,9 +5,10 @@ import os
 import shutil
 import sys
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtGui import QColor, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
@@ -62,6 +63,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings=None, quicktune_path=None):
         super().__init__()
         apply_light_theme(QApplication.instance())
+        self.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "radio.svg")))
         self.setWindowTitle("Icom Remote Next %s" % __version__)
         self.setStyleSheet("""
             QGroupBox { font-weight: 600; border: 1px solid palette(mid);

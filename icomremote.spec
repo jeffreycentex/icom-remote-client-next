@@ -1,5 +1,5 @@
 # PyInstaller spec. Use build.py, or directly:  pyinstaller --noconfirm icomremote.spec
-# Produces dist/Icom Remote.app (macOS) or dist/Icom Remote/ (Windows, Linux).
+# Produces a macOS app bundle or a single Windows/Linux executable.
 # PyInstaller does not cross-compile: build on each target OS.
 #
 # ICOMREMOTE_CONSOLE=1 builds with a console window (Windows troubleshooting).
@@ -23,14 +23,16 @@ console = os.environ.get("ICOMREMOTE_CONSOLE") == "1"
 a = Analysis(["run_icomremote.py"], pathex=["."], hiddenimports=hidden,
              excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
                        "PySide6.Qt3DCore", "PySide6.QtQuick", "PySide6.QtQml"],
+             datas=[("icomremote/assets/radio.svg", "icomremote/assets")],
              noarchive=False)
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Icom Remote",
-          console=console, upx=False)
-coll = COLLECT(exe, a.binaries, a.datas, name="Icom Remote", upx=False)
 if sys.platform == "darwin":
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Icom Remote",
+              console=console, upx=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name="Icom Remote", upx=False)
     app = BUNDLE(
         coll, name="Icom Remote.app", bundle_identifier="net.icomremote.app", version=VERSION,
+        icon="icomremote/assets/radio.icns",
         info_plist={
             "CFBundleShortVersionString": VERSION,
             "CFBundleVersion": VERSION,
@@ -42,3 +44,7 @@ if sys.platform == "darwin":
             "NSLocalNetworkUsageDescription":
                 "Icom Remote connects to your radio's network server on the local network.",
         })
+else:
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="Icom Remote",
+              icon="icomremote/assets/radio.ico" if sys.platform == "win32" else None,
+              console=console or sys.platform != "win32", upx=False)

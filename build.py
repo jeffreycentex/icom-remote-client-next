@@ -7,8 +7,8 @@
 
 Output in dist/:
     macOS    Icom Remote.app      + IcomRemote-<ver>-macos-<arch>.zip
-    Windows  Icom Remote\\         + IcomRemote-<ver>-windows-<arch>.zip
-    Linux    Icom Remote/          + IcomRemote-<ver>-linux-<arch>.tar.gz
+    Windows  Icom Remote.exe      + IcomRemote-<ver>-windows-<arch>.zip
+    Linux    Icom Remote          + IcomRemote-<ver>-linux-<arch>.tar.gz
 
 Run it from a virtual environment. PyInstaller does not cross-compile.
 """
@@ -43,7 +43,7 @@ def executable():
     if sys.platform == "darwin":
         return os.path.join(DIST, "Icom Remote.app", "Contents", "MacOS", "Icom Remote")
     name = "Icom Remote.exe" if sys.platform == "win32" else "Icom Remote"
-    return os.path.join(DIST, "Icom Remote", name)
+    return os.path.join(DIST, name)
 
 
 def self_check():
@@ -81,9 +81,9 @@ def archive():
         # ditto keeps the bundle's symlinks and code signature intact
         run(["ditto", "-c", "-k", "--keepParent", os.path.join(DIST, "Icom Remote.app"), out], check=True)
     elif sys.platform == "win32":
-        out = shutil.make_archive(os.path.join(DIST, base), "zip", DIST, "Icom Remote")
+        out = shutil.make_archive(os.path.join(DIST, base), "zip", DIST, os.path.basename(executable()))
     else:
-        out = shutil.make_archive(os.path.join(DIST, base), "gztar", DIST, "Icom Remote")
+        out = shutil.make_archive(os.path.join(DIST, base), "gztar", DIST, os.path.basename(executable()))
     print("\nBuilt: %s (%.0f MB)" % (out, os.path.getsize(out) / 1e6))
     return out
 

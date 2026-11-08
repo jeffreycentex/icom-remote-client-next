@@ -605,7 +605,7 @@ IC-7300MK2. Covered:
 > repository's own Releases or Actions pages. If in doubt, run from source
 > instead (see [Install](#install)); it's the same code.
 
-Tagged versions (`v0.9` …) are under **Releases**, with a zip per OS. Every
+Tagged versions are under **Releases**, with a download for each OS. Every
 push to `main` is also tested and built by GitHub Actions: **Actions** tab →
 latest *test-and-build* run → **Artifacts** (`IcomRemote-macOS`,
 `IcomRemote-Windows`, `IcomRemote-Linux`; kept 30 days).
@@ -619,11 +619,11 @@ latest *test-and-build* run → **Artifacts** (`IcomRemote-macOS`,
   it can't reach the radio or read transmit audio. Because each build has a
   new ad-hoc signature, macOS may ask for these permissions again after an
   update. The macOS build is for Apple Silicon.
-- **Windows**: unzip anywhere and run `Icom Remote\Icom Remote.exe`.
+- **Windows**: unzip anywhere and run `Icom Remote.exe`.
   SmartScreen may warn about an unknown publisher: *More info* → *Run
   anyway*. Allow it through the firewall (private networks) when asked.
 - **Linux**: `tar xzf IcomRemote-*-linux-*.tar.gz` and run
-  `"Icom Remote/Icom Remote"`. Needs PortAudio (`libportaudio2`).
+  `./"Icom Remote"`. Needs PortAudio (`libportaudio2`).
 
 ### Build it yourself
 
