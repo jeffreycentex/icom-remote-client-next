@@ -468,6 +468,9 @@ class RadioSession:
                     if n % 4 == 0:                # cheap probe: does CI-V answer again?
                         self._tx_civ(civ.read_freq(addr))
                     continue
+                # A missed PTT readback must not leave the last TX state latched.
+                if self.tx or self._keyed or n % 8 == 0:
+                    self._tx_civ(civ.read_ptt(addr))
                 if self.tx or self._keyed or self._tuning:
                     self._tx_civ(civ.read_po(addr))
                     self._tx_civ(civ.read_swr(addr))

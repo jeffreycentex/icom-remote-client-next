@@ -124,6 +124,7 @@ class FakeRadio:
         self.menu_ng = menu_ng               # radio that doesn't know these menu items
         self.menu_writes = []
         self.ptt = False
+        self.drop_next_rx_ptt_read = False
         self.ptt_log = []                    # (time, on)
         self.freq_log = []                   # (time, hz) of every frequency set
         self.ng_data_reads = 0               # answer this many DATA reads (1A 06) with NG only
@@ -400,6 +401,9 @@ class FakeRadio:
             return echo + [mk(0x15, payload[0], civ.encode_level(v))]
         if cmd == 0x1C and payload[:1] == b"\x00":
             if len(payload) == 1:
+                if not self.ptt and self.drop_next_rx_ptt_read:
+                    self.drop_next_rx_ptt_read = False
+                    return echo
                 return echo + [mk(0x1C, 0x00, b"\x01" if self.ptt else b"\x00")]
             self.ptt = payload[1] == 1
             self.ptt_log.append((time.monotonic(), self.ptt))

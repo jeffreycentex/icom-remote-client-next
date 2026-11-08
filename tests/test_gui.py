@@ -290,8 +290,15 @@ class TestGui(unittest.TestCase):
         space(True)                                          # armed, plain USB: voice
         self.assertTrue(self.pump_until(lambda: self.radio.ptt and w.tx_indicator.text() == "TX"))
         self.assertEqual(w.radio._tx_kind, "voice")
+        # Lose the immediate RX readback after PTT off.
+        self.radio.drop_next_rx_ptt_read = True
         space(False)
-        self.assertTrue(self.pump_until(lambda: not self.radio.ptt))
+        self.assertTrue(self.pump_until(lambda: w.tx_indicator.text() == "RX"))
+        self.assertFalse(self.radio.ptt)
+        self.assertFalse(self.radio.drop_next_rx_ptt_read)
+        w.service.set_frequency(7_100_000)
+        w.service.set_filter(2)
+        self.assertTrue(self.pump_until(lambda: self.radio.freq_hz == 7_100_000 and self.radio.filt == 2))
 
         w.host.setFocus()                                    # armed: Space is PTT even in a text field
         space(True)
