@@ -251,12 +251,58 @@ class CivDecoder:
         if cmd == 0x15 and len(payload) >= 3:
             return [({0x02: "smeter", 0x11: "po", 0x12: "swr"}.get(payload[0], "meter_%02x" % payload[0]),
                      decode_level(payload[1:3]))]
+        dsp = DSP_FIELDS.get((cmd, payload[0])) if payload else None
+        if dsp is not None:
+            maximum = DSP_COMMANDS[dsp][2]
+            data = payload[1:]
+            if maximum == 255 and len(data) == 2 and all(
+                    b >> 4 < 10 and b & 15 < 10 for b in data):
+                value = decode_level(data)
+            elif maximum != 255 and len(data) == 1:
+                value = data[0]
+            else:
+                return []
+            return [("dsp", (dsp, value))] if value <= maximum else []
         if cmd == 0x14 and len(payload) >= 3:
             return [({0x0A: "rfpower"}.get(payload[0], "level_%02x" % payload[0]),
                      decode_level(payload[1:3]))]
         if cmd == 0x1C and len(payload) >= 2:
             return [({0x00: "ptt", 0x01: "tuner"}.get(payload[0], "tx_%02x" % payload[0]), payload[1])]
         return [("other", bytes(f))]
+
+
+# IC-7300MK2 receive DSP controls. Levels and position use two BCD bytes.
+DSP_COMMANDS = {
+    "nr": (0x16, 0x40, 1),
+    "nr_level": (0x14, 0x06, 255),
+    "nb": (0x16, 0x22, 1),
+    "nb_level": (0x14, 0x12, 255),
+    "auto_notch": (0x16, 0x41, 1),
+    "manual_notch": (0x16, 0x48, 1),
+    "position": (0x14, 0x0D, 255),
+    "width": (0x16, 0x57, 2),
+}
+DSP_FIELDS = {(cmd, sub): name for name, (cmd, sub, _) in DSP_COMMANDS.items()}
+
+
+def dsp_frame(addr, name, value=None):
+    cmd, sub, maximum = DSP_COMMANDS[name]
+    if value is None:
+        return frame(addr, cmd, sub)
+    if not isinstance(value, int) or not 0 <= value <= maximum:
+        raise ValueError("invalid receive DSP value")
+    return frame(addr, cmd, sub, encode_level(value) if maximum == 255 else bytes([value]))
+
+
+def dsp_fields(mode):
+    fields = set()
+    if mode in ("USB", "LSB", "AM", "FM", "CW", "CW-R", "RTTY", "RTTY-R"):
+        fields.update(("nr", "nr_level"))
+    if mode in ("USB", "LSB", "AM", "CW", "CW-R", "RTTY", "RTTY-R"):
+        fields.update(("nb", "nb_level", "manual_notch", "position", "width"))
+    if mode in ("USB", "LSB", "AM", "FM"):
+        fields.add("auto_notch")
+    return fields
 
 
 # ---------------------------------------------------------------- commands

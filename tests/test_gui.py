@@ -126,6 +126,91 @@ class TestGui(unittest.TestCase):
         self.assertFalse(settings.contains("password"))
         self.assertEqual(settings.value("api_token"), "")
 
+    def test_dsp_reads_and_changes_radio_settings(self):
+        from icomremote.session import ConnectionSpec
+
+        w = self.w
+        p = self.radio.ports
+        w.service.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer",
+                                         p["control"], p["serial"], p["audio"]))
+        dsp_tab = next(i for i in range(w.tabs.count()) if w.tabs.tabText(i) == "DSP")
+        w.tabs.setCurrentIndex(dsp_tab)
+        self.assertTrue(self.pump_until(lambda: w.dsp_notch.isEnabled()))
+        w.dsp_widgets["nr"].click()
+        w.dsp_widgets["nr_level"].setValue(4)
+        w.dsp_widgets["nb_level"].setValue(67)
+        self.assertTrue(self.pump_until(lambda: w._dsp_state.get("nr_level") == 72
+                                       and w._dsp_state.get("nb_level") == 171))
+        self.assertEqual(self.radio.dsp["nr"], 1)
+        self.assertEqual(self.radio.dsp["nb"], 0)
+        for mode in ("auto_notch", "manual_notch"):
+            index = w.dsp_notch.findData(mode)
+            w.dsp_notch.setCurrentIndex(index)
+            w.dsp_notch.activated.emit(index)
+            self.assertTrue(self.pump_until(lambda: w.dsp_notch.currentData() == mode))
+        self.assertTrue(w.dsp_widgets["position"].isEnabled())
+        w.dsp_widgets["position"].setValue(128)
+        w.dsp_widgets["width"].activated.emit(2)
+        self.assertTrue(self.pump_until(lambda: w._dsp_state.get("position") == 128
+                                       and w._dsp_state.get("width") == 2))
+        self.assertEqual(self.radio.dsp["auto_notch"], 0)
+
+    def test_log_view_updates_and_exports_full_file(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        w = self.w
+        w.log_path = Path(self.tmp) / "active.log"
+        original = b"old entry\n" * 30_000 + b"latest entry\n"
+        w.log_path.write_bytes(original)
+        log_tab = w.tabs.count() - 1
+        self.assertEqual(w.tabs.tabText(log_tab), "Log")
+        w.tabs.setCurrentIndex(log_tab)
+        self.assertTrue(self.pump_until(lambda: w.log_export_btn.isEnabled()))
+        self.assertIn("latest entry", w.log_view.toPlainText())
+        self.assertLess(len(w.log_view.toPlainText()), len(original))
+        with w.log_path.open("ab") as log:
+            log.write(b"new entry\n")
+        self.assertTrue(self.pump_until(lambda: "new entry" in w.log_view.toPlainText()))
+        output = Path(self.tmp) / "export.log"
+        with patch("icomremote.gui.QFileDialog.getSaveFileName", return_value=(str(output), "")):
+            w.log_export_btn.click()
+        self.assertEqual(output.read_bytes(), original + b"new entry\n")
+
+    def test_low_power_tune_times_out_and_restores_power(self):
+        import numpy as np
+        from icomremote.session import ConnectionSpec
+
+        w = self.w
+        p = self.radio.ports
+        self.radio.data = True
+        original = self.radio.rf_power
+        w.service.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer",
+                                         p["control"], p["serial"], p["audio"]))
+        self.assertTrue(self.pump_until(lambda: w.low_tune_btn.isEnabled() and w.radio._mods_ready is True and w.radio.rig.data))
+        w.low_tune_btn.click()
+        self.assertTrue(self.pump_until(lambda: self.radio.ptt and self.radio.tx_audio_while_ptt))
+        self.assertEqual(self.radio.rf_power, 13)
+        self.assertTrue(self.pump_until(lambda: not w.radio.low_tuning, timeout=12))
+        duration = self.radio.ptt_log[1][0] - self.radio.ptt_log[0][0]
+        self.assertAlmostEqual(duration, 10, delta=0.3)
+        samples = np.frombuffer(bytes(self.radio.tx_audio), dtype="<i2")
+        spectrum = abs(np.fft.rfft(samples)) ** 2
+        frequencies = np.fft.rfftfreq(len(samples), 1 / 48000)
+        in_band = abs(frequencies - 1000) <= 25
+        self.assertGreater(spectrum[in_band].sum() / spectrum.sum(), 0.99)
+        self.assertFalse(self.radio.ptt)
+        self.assertEqual(self.radio.rf_power_writes[-2:], [13, original])
+        self.assertEqual(self.radio.rf_power, original)
+        self.assertEqual(self.radio.tune_started, [])
+
+        w.low_tune_btn.click()
+        self.assertTrue(self.pump_until(lambda: self.radio.ptt))
+        w.low_tune_btn.click()
+        self.assertTrue(self.pump_until(lambda: not w.radio.low_tuning))
+        self.assertFalse(self.radio.ptt)
+        self.assertEqual(self.radio.rf_power, original)
+
     def test_connect_and_control(self):
         w = self.w
         self.assertFalse(w.freq.isEnabled())               # disabled until connected
@@ -242,9 +327,11 @@ class TestGui(unittest.TestCase):
         self.assertFalse(w.quicktune_box.isVisible())                 # no file: no box
         with open(self.quicktune, "w") as f:
             f.write("# name, kHz\n40mFT8, 7074.00\n20mFT8, 14074\nWay too long name, 3573\n")
+            f.writelines("Preset %d, %d\n" % (i, 7000 + i) for i in range(4, 16))
         self.assertTrue(self.pump_until(lambda: w.quicktune_box.isVisible(), 3))   # picked up while running
         shown = [b.text() for b in w.quicktune_buttons if b.isVisible()]
-        self.assertEqual(shown, ["40mFT8", "20mFT8", "Way too lo"])
+        self.assertEqual(shown, ["40mFT8", "20mFT8", "Way too lo"]
+                         + ["Preset %d" % i for i in range(4, 16)])
         self.assertFalse(w.quicktune_buttons[0].isEnabled())           # not connected yet
         p = self.radio.ports
         w.radio.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer", p["control"], p["serial"], p["audio"]))
@@ -252,8 +339,8 @@ class TestGui(unittest.TestCase):
         mode = (self.radio.mode, self.radio.data, self.radio.filt)
         w.quicktune_buttons[0].click()
         self.assertTrue(self.pump_until(lambda: self.radio.freq_hz == 7_074_000 and w.freq.value() == 7074.0))
-        w.quicktune_buttons[1].click()
-        self.assertTrue(self.pump_until(lambda: self.radio.freq_hz == 14_074_000))
+        w.quicktune_buttons[14].click()
+        self.assertTrue(self.pump_until(lambda: self.radio.freq_hz == 7_015_000))
         time.sleep(0.3)
         self.assertEqual((self.radio.mode, self.radio.data, self.radio.filt), mode)   # frequency only
         os.remove(self.quicktune)

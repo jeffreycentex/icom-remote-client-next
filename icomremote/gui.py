@@ -7,11 +7,11 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QIODevice, QObject, QSaveFile, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QSlider, QSpinBox, QStatusBar, QTabWidget, QVBoxLayout, QWidget)
 
 from . import __version__, civ, quicktune
@@ -60,7 +60,7 @@ class _Bridge(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings=None, quicktune_path=None):
+    def __init__(self, settings=None, quicktune_path=None, log_path=None):
         super().__init__()
         apply_light_theme(QApplication.instance())
         self.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "radio.svg")))
@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
         self.rigctld = None
         self.api = None
         self.quicktune_path = quicktune_path or self.settings.value("quicktune_path", quicktune.default_path())
+        self.log_path = Path(log_path) if log_path else None
+        self._log_stamp = None
         self._quicktune_stamp = ()          # (mtime, size) of the file last read; None = no file
         self._editing_freq = False
         self._rec_started = None
@@ -138,13 +140,16 @@ class MainWindow(QMainWindow):
             ("Audio", (self._build_audio_box(), self.tx_audio_box)),
             ("Recording and control", (self._build_record_box(), self._build_rigctl_box(),
                                       self._build_api_box())),
+            ("DSP", (self._build_dsp_box(),)),
+            ("Log", (self._build_log_box(),)),
         ):
             page = QWidget()
             layout = QVBoxLayout(page)
             layout.setSpacing(5)
             for box in boxes:
                 layout.addWidget(box)
-            layout.addStretch(1)
+            if title != "Log":
+                layout.addStretch(1)
             self.tabs.addTab(page, title)
         self.tabs.currentChanged.connect(self._tab_changed)
         self.resize(740, 760)
@@ -176,6 +181,203 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self)
 
     # ================================================================== layout
+    def _build_log_box(self):
+        self.log_box = QGroupBox("Current session")
+        layout = QVBoxLayout(self.log_box)
+        self.log_view = QPlainTextEdit(readOnly=True)
+        self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.log_view.setAccessibleName("Application log")
+        layout.addWidget(self.log_view, 1)
+        row = QHBoxLayout()
+        self.log_status = QLabel("The log is unavailable.")
+        row.addWidget(self.log_status, 1)
+        self.log_export_btn = QPushButton("Export Log…")
+        self.log_export_btn.setEnabled(False)
+        self.log_export_btn.clicked.connect(self._export_log)
+        row.addWidget(self.log_export_btn)
+        layout.addLayout(row)
+        return self.log_box
+
+    def _refresh_log(self):
+        if self.log_path is None:
+            return
+        try:
+            stat = self.log_path.stat()
+            stamp = stat.st_ino, stat.st_mtime_ns, stat.st_size
+            if stamp == self._log_stamp:
+                return
+            # Keep the viewer responsive even with verbose packet logging.
+            offset = max(0, stat.st_size - 256 * 1024)
+            with self.log_path.open("rb") as source:
+                source.seek(offset)
+                data = source.read(256 * 1024)
+            if offset:
+                _, _, data = data.partition(b"\n")
+        except OSError:
+            self._log_stamp = None
+            self.log_status.setText("The log is unavailable.")
+            self.log_view.clear()
+            self.log_export_btn.setEnabled(False)
+            return
+
+        scroll = self.log_view.verticalScrollBar()
+        previous = scroll.value()
+        at_end = previous == scroll.maximum()
+        self.log_view.setPlainText(data.decode("utf-8", errors="replace"))
+        scroll.setValue(scroll.maximum() if at_end else previous)
+        self.log_status.setText("Showing the latest entries. Export includes the full log."
+                                if offset else "Updates while this tab is open.")
+        self.log_export_btn.setEnabled(True)
+        self._log_stamp = stamp
+
+    def _export_log(self):
+        if self.log_path is None:
+            return
+        name, _ = QFileDialog.getSaveFileName(
+            self, "Export Log", "icomremote-export.log", "Log files (*.log);;All files (*)")
+        if not name:
+            return
+        destination = QSaveFile(name)
+        try:
+            path = Path(name)
+            if path.exists() and path.samefile(self.log_path):
+                raise OSError("Choose a different file from the active log.")
+            with self.log_path.open("rb") as source:
+                if not destination.open(QIODevice.WriteOnly):
+                    raise OSError(destination.errorString())
+                remaining = os.fstat(source.fileno()).st_size
+                while remaining:
+                    data = source.read(min(remaining, 64 * 1024))
+                    if not data:
+                        raise OSError("The source log changed during export.")
+                    if destination.write(data) != len(data):
+                        raise OSError(destination.errorString())
+                    remaining -= len(data)
+                if not destination.commit():
+                    raise OSError(destination.errorString())
+        except OSError as exc:
+            destination.cancelWriting()
+            QMessageBox.warning(self, "Export Log", str(exc))
+            return
+        self.statusBar().showMessage("Log exported to %s" % name, 5000)
+
+    def _build_dsp_box(self):
+        box = QGroupBox("Receive DSP")
+        layout = QGridLayout(box)
+        self.dsp_status = QLabel("Connect to an IC-7300MK2 to use receive DSP.")
+        self.dsp_status.setWordWrap(True)
+        layout.addWidget(self.dsp_status, 0, 0, 1, 3)
+        self.dsp_widgets = {}
+        self.dsp_values = {}
+        self.dsp_timers = {}
+        for row, (key, label) in enumerate((
+                ("nr", "Noise Reduction"), ("nb", "Noise Blanker")), start=1):
+            toggle = QCheckBox(label)
+            toggle.clicked.connect(lambda value, name=key: self._set_dsp(name, int(value)))
+            self.dsp_widgets[key] = toggle
+            layout.addWidget(toggle, row, 0)
+            maximum = 15 if key == "nr" else 100
+            self._add_dsp_slider(layout, row, key + "_level", maximum, label + " level")
+        self.dsp_notch = QComboBox()
+        self.dsp_notch.activated.connect(
+            lambda _: self._set_dsp("notch", self.dsp_notch.currentData()))
+        layout.addWidget(QLabel("Notch"), 3, 0)
+        layout.addWidget(self.dsp_notch, 3, 1)
+        layout.addWidget(QLabel("Notch position"), 4, 0)
+        self._add_dsp_slider(layout, 4, "position", 255, "Notch position")
+        self.dsp_widgets["position"].setToolTip(
+            "Position in the receive passband. 128 is the midpoint.")
+        width = QComboBox()
+        width.addItems(("Wide", "Mid", "Narrow"))
+        width.activated.connect(lambda value: self._set_dsp("width", value))
+        self.dsp_widgets["width"] = width
+        layout.addWidget(QLabel("Notch width"), 5, 0)
+        layout.addWidget(width, 5, 1)
+        layout.setColumnStretch(1, 1)
+        self._dsp_state = {}
+        self._show_dsp()
+        return box
+
+    def _add_dsp_slider(self, layout, row, name, maximum, label):
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, maximum)
+        slider.setAccessibleName(label)
+        timer = QTimer(slider, singleShot=True, interval=250)
+        slider.valueChanged.connect(lambda _: None if slider.isSliderDown() else timer.start())
+        self.dsp_timers[name] = timer
+        def apply_level():
+            value = slider.value()
+            if name == "nr_level":
+                value = value * 16 + 8       # verified IC-7300MK2 NR steps 0–15
+            elif name == "nb_level":
+                value = round(value * 255 / 100)
+            self._set_dsp(name, value)
+        timer.timeout.connect(apply_level)
+        slider.sliderPressed.connect(timer.stop)
+        slider.sliderReleased.connect(timer.start)
+        self.dsp_widgets[name] = slider
+        self.dsp_values[name] = QLabel("—")
+        layout.addWidget(slider, row, 1)
+        layout.addWidget(self.dsp_values[name], row, 2)
+
+    def _set_dsp(self, name, value):
+        self._control(self.service.set_dsp, name, value)
+        self._show_dsp()
+
+    def _show_dsp(self):
+        ready = self.radio.dsp_ready
+        fields = civ.dsp_fields(self.radio.rig.mode)
+        state = self._dsp_state
+        if not self.radio.connected:
+            message = "Connect to an IC-7300MK2 to use receive DSP."
+        elif not self.radio.dsp_supported:
+            message = "Receive DSP is unavailable for this radio."
+        elif not ready:
+            message = "Receive DSP controls are available while receiving."
+        elif not fields:
+            message = "Receive DSP is unavailable in this mode."
+        elif not state:
+            message = "Waiting for the radio's receive DSP settings…"
+        else:
+            message = "Settings shown are read back from the radio."
+        self.dsp_status.setText(message)
+
+        notch_choices = [("Off", "off")]
+        for label, name in (("Auto", "auto_notch"), ("Manual", "manual_notch")):
+            if name in fields:
+                notch_choices.append((label, name))
+        if [self.dsp_notch.itemData(i) for i in range(self.dsp_notch.count())] != [
+                name for _, name in notch_choices]:
+            self.dsp_notch.clear()
+            for label, name in notch_choices:
+                self.dsp_notch.addItem(label, name)
+        notch_known = len(notch_choices) > 1 and all(name in state for _, name in notch_choices[1:])
+        selected = next((name for _, name in notch_choices[1:] if state.get(name)), "off")
+        self.dsp_notch.setCurrentIndex(self.dsp_notch.findData(selected) if notch_known else -1)
+        self.dsp_notch.setEnabled(ready and notch_known)
+        for name, widget in self.dsp_widgets.items():
+            value = state.get(name) if name in fields else None
+            manual_only = name in ("position", "width")
+            widget.setEnabled(ready and value is not None and (not manual_only or selected == "manual_notch"))
+            widget.blockSignals(True)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentIndex(value if value is not None else -1)
+            elif not widget.isSliderDown() and not self.dsp_timers[name].isActive():
+                shown = value or 0
+                suffix = ""
+                if name == "nr_level":
+                    shown //= 16
+                elif name == "nb_level":
+                    shown = round(shown * 100 / 255)
+                    suffix = "%"
+                else:
+                    suffix = " / 255"
+                widget.setValue(shown)
+                self.dsp_values[name].setText(f"{shown}{suffix}" if value is not None else "—")
+            widget.blockSignals(False)
+
     def _build_radio_box(self):
         box = QGroupBox("Radio")
         g = QGridLayout(box)
@@ -390,6 +592,10 @@ class MainWindow(QMainWindow):
         self.tune_btn.setToolTip("Run the internal antenna tuner's tune cycle (like the radio's TUNER\n"
                                  "button). Transmits a carrier; stopped after 30 s or on disconnect.")
         self.tune_btn.clicked.connect(self._tune_clicked)
+        self.low_tune_btn = QPushButton("Low Power Tune")
+        self.low_tune_btn.setEnabled(False)
+        self.low_tune_btn.setToolTip("Send a 1 kHz tone in USB-D or LSB-D at 5% power for up to 10 seconds.")
+        self.low_tune_btn.clicked.connect(self._low_tune_clicked)
         self.tuner_label = QLabel("Tuner: —")
         self.ptt_timeout = QSpinBox(minimum=10, maximum=600, value=180, suffix=" s")
         self.ptt_timeout.setToolTip("Transmit is cut off after this long, whatever keyed it")
@@ -431,6 +637,7 @@ class MainWindow(QMainWindow):
         prow.addWidget(self.rf_power, 1)
         prow.addWidget(self.rf_power_label)
         prow.addSpacing(12)
+        prow.addWidget(self.low_tune_btn)
         prow.addWidget(self.tune_btn)
         prow.addWidget(self.tuner_label)
         g.addLayout(prow, 5, 0, 1, 5)
@@ -699,6 +906,7 @@ class MainWindow(QMainWindow):
         if on and self.radio.info is not None and not civ.has_tuner(self.radio.info.radio_name):
             self.tune_btn.setEnabled(False)
             self.tune_btn.setToolTip("This radio has no antenna tuner command")
+        self.low_tune_btn.setEnabled(on and self.radio.low_tune_supported)
         self.manage_data_mod.setEnabled(not on)     # these take effect at connect time
         self.manage_data_off_mod.setEnabled(not on)
 
@@ -979,8 +1187,12 @@ class MainWindow(QMainWindow):
         self.rf_power_label.setText("%d %%" % v)
         try:
             self.service.set_rf_power(v)
-        except NotConnected as e:
+        except (NotConnected, PttRefused) as e:
             self.statusBar().showMessage(str(e), 5000)
+
+    def _low_tune_clicked(self):
+        action = self.service.stop_low_tune if self.radio.low_tuning else self.service.start_low_tune
+        self._control(action)
 
     def _tune_clicked(self, *_):
         try:
@@ -1035,7 +1247,10 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _tab_changed(self, index):
+        if self.log_box.isVisible():
+            self._refresh_log()
         if index != 0:
+            self.service.stop_low_tune()
             self._space_release()
             self.voice_arm.setChecked(False)
 
@@ -1069,7 +1284,8 @@ class MainWindow(QMainWindow):
                     else:
                         self._space_release()
                 return True                       # don't let Space click a focused button
-        elif t in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate) and self._space_down:
+        elif t in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
+            self.service.stop_low_tune()
             self._space_release()                 # a key release we'd never see
         return False
 
@@ -1138,7 +1354,12 @@ class MainWindow(QMainWindow):
     # ================================================================== events (GUI thread)
     @Slot(str, object)
     def _on_event(self, kind, payload):
-        if kind == "rig":
+        if kind == "dsp":
+            self._dsp_state = payload
+            if not payload:
+                for timer in self.dsp_timers.values():
+                    timer.stop()
+        elif kind == "rig":
             self._show_rig(payload)
         elif kind == "meter":
             name, raw = payload
@@ -1157,6 +1378,9 @@ class MainWindow(QMainWindow):
                 self.rf_power_label.setText("%d %%" % self.rf_power.value())
         elif kind == "tuner":
             self._show_tuner(payload)
+        elif kind == "low_tune":
+            self.low_tune_btn.setText("Stop Low Power Tune" if payload else "Low Power Tune")
+            self.rf_power.setEnabled(not payload and self.radio.power == "on")
         elif kind == "tuning":
             self.tune_btn.setEnabled(not payload and self.radio.connected)
             self._set_on_air(payload or self.radio.tx)
@@ -1183,6 +1407,10 @@ class MainWindow(QMainWindow):
         elif kind == "remote_power_setting":
             pass                                  # logged only; its effect on the LAN is unclear
         elif kind == "connected":
+            if not payload:
+                self._dsp_state = {}
+                for timer in self.dsp_timers.values():
+                    timer.stop()
             self._set_controls_enabled(payload and self.radio.power == "on")
             if payload:
                 self.connect_btn.setText("Disconnect")
@@ -1245,10 +1473,14 @@ class MainWindow(QMainWindow):
         elif kind == "rig_command":
             self.statusBar().showMessage("rigctl: %s" % payload, 3000)
 
+        if kind in ("dsp", "rig", "radio", "connected", "power", "ptt", "tx", "tuning", "tuner", "low_tune"):
+            self._show_dsp()
         if kind in ("status", "connected", "stopped", "power"):
             self._refresh_connection_state()
 
     def _tick(self, *_):
+        if self.log_box.isVisible():
+            self._refresh_log()
         self._refresh_connection_state()
         self._check_quicktune()
         if self.radio.recording_seconds() is not None and self._rec_started is not None:
@@ -1276,9 +1508,9 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
-def run(argv):
+def run(argv, log_path=None):
     app = QApplication(argv)
     app.setApplicationName("Icom Remote Next")
-    w = MainWindow()
+    w = MainWindow(log_path=log_path)
     w.show()
     return app.exec()

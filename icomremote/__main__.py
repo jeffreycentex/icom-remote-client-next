@@ -165,7 +165,9 @@ def main():
     except ImportError as e:
         sys.stderr.write("Missing dependency: %s\nInstall with:  pip install -r requirements.txt\n" % e)
         return 1
-    return run([sys.argv[0]] + qt_args)
+    active_log = next((handler.baseFilename for handler in handlers
+                       if isinstance(handler, logging.FileHandler)), None)
+    return run([sys.argv[0]] + qt_args, log_path=active_log)
 
 
 if __name__ == "__main__":

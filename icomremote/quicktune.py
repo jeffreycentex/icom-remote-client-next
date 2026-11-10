@@ -1,4 +1,4 @@
-"""Quick-tune buttons: up to 10 named frequencies read from a text file.
+"""Quick-tune buttons: up to 15 named frequencies read from a text file.
 
 File: <settings dir>/quicktune.txt (see restore.default_dir). One button per
 line, "name, frequency in kHz"; blank lines and lines starting with # are
@@ -16,7 +16,7 @@ from .restore import default_dir
 log = logging.getLogger(__name__)
 
 FILE_NAME = "quicktune.txt"
-MAX_BUTTONS = 10
+MAX_BUTTONS = 15
 MAX_LABEL = 10
 
 

@@ -24,10 +24,10 @@ class TestQuickTune(unittest.TestCase):
         self.assertEqual(len(problems), 5)
         self.assertIn("cut to 10", problems[4])
 
-    def test_max_ten(self):
-        entries, problems = quicktune.parse("".join("B%d, %d\n" % (i, 7000 + i) for i in range(12)))
-        self.assertEqual(len(entries), 10)
-        self.assertEqual(entries[-1], ("B9", 7_009_000))
+    def test_max_fifteen(self):
+        entries, problems = quicktune.parse("".join("B%d, %d\n" % (i, 7000 + i) for i in range(17)))
+        self.assertEqual(len(entries), 15)
+        self.assertEqual(entries[-1], ("B14", 7_014_000))
         self.assertEqual(len(problems), 1)
 
     def test_load(self):

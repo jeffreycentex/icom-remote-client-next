@@ -73,8 +73,8 @@ scope, CW/RTTY modes.
 - **Meters**: bar = S-meter always. Separate "Output NN %  SWR N.N" readout
   next to PTT timeout with a dot: green < 1.5, yellow < 2.5, red >= 2.5,
   grey off-air. (A bar that switched to Po/SWR on TX confused the owner.)
-- **Layout**: Radio contains connection, tuning, presets and both PTT controls. Audio contains device and routing settings. Recording and control contains recording, CAT and HTTP settings. Tabs use direct layouts with no scroll areas. Verify fit with ten presets and the connection error banner. Display the connection failure once, in the header. Credential feedback shares a fixed-height slot beside Exit, with password on Radio and token on Recording and control.
-- **Presets**: up to 10 frequency-only buttons from a file containing `name, kHz` per line, names max 10 characters. The default is `quicktune.txt` in the state directory. Import remembers the chosen path. The file is checked every 0.5 seconds. Tests inject a temporary `quicktune_path`.
+- **Layout**: Radio contains connection, tuning, presets and both PTT controls. Audio contains device and routing settings. Recording and control contains recording, CAT and HTTP settings. Tabs use direct layouts with no scroll areas. Verify fit with fifteen presets and the connection error banner. Display the connection failure once, in the header. Credential feedback shares a fixed-height slot beside Exit, with password on Radio and token on Recording and control.
+- **Presets**: up to 15 frequency-only buttons from a file containing `name, kHz` per line, names max 10 characters. The default is `quicktune.txt` in the state directory. Import remembers the chosen path. The file is checked every 0.5 seconds. Tests inject a temporary `quicktune_path`.
 - **Standby**: show state and disable tuning and TX. Use the radio's physical power control. Preserve session-level power handling and its regression tests.
 - `samplerate` removed from requirements (Windows build pain; linear
   resampling is inaudible at 48 kHz). PyAV stays for M4A.

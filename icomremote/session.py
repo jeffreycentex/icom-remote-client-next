@@ -65,6 +65,9 @@ MODS_SETUP_WAIT = 8.0               # key-down waits this long for DATA MOD setu
 TX_INPUT_WATCHDOG = 1.0             # keyed and no audio from the input for this long: reopen it
 SINK_STALL_SECONDS = 2.0            # audio arriving but the sound card has stopped asking for it
 HEALTH_LOG_INTERVAL = 60.0
+LOW_TUNE_SECONDS = 10
+LOW_TUNE_POWER = 13                  # closest CI-V step to 5%
+LOW_TUNE_TONE_HZ = 1000
 MAX_GAP_FILL = 1800.0               # seconds of silence inserted into a recording for one gap
 
 
@@ -171,6 +174,9 @@ class RadioSession:
         self.tuner = None                # 0 off, 1 on, 2 tuning
         self._tuning = False             # a TUNE started from the app is running
         self._tune_timer = None
+        self._low_tune_task = None
+        self._low_tune_stop = False
+        self._low_tune_keyed = False
         # power: "on", "standby" (network up, CI-V silent) or None (unknown)
         self.power = None
         self.remote_power_setting = None   # 1A 05 01 09 value, None = unknown
@@ -193,6 +199,7 @@ class RadioSession:
         self._mod_retry = None           # task re-reading DATA MOD after a failed read
         self._wake_setup = None          # task switching DATA MOD to LAN after the radio woke up
         self._health_at = 0.0
+        self.dsp = {}
         self._ptt_owner = None
         self._ptt_timer = None
         self._tx_devices = {"data": None, "voice": None}   # kind -> (key, gain)
@@ -384,6 +391,9 @@ class RadioSession:
         finally:
             for t in tasks:
                 t.cancel()
+            if self._low_tune_task is not None:
+                self.stop_low_tune()
+                await self._low_tune_task
             # Unkey and put radio settings back while the serial stream may still work.
             if serial is not None and not serial.closed:
                 try:
@@ -398,6 +408,7 @@ class RadioSession:
                 self._unkey()
             self._close_tx_sources()
             self.power = None
+            self.dsp.clear()
             self._rec_gap_pending = True
             self._powering_on = False
             self._set_connected(False)
@@ -481,6 +492,8 @@ class RadioSession:
                 if (n % MOD_RETRY_TICKS == 0 and self._mods_ready is True and self._mod_retry is None
                         and not self._keyed and self._unknown_mods()):
                     self._mod_retry = self._loop.create_task(self._retry_unknown_mods())
+                if n % 8 == 0 and self.dsp_ready:
+                    self._read_dsp()
                 if n % 8 == 0:            # the radio also pushes changes (CI-V transceive)
                     self._tx_civ(civ.read_freq(addr))
                     self._tx_civ(civ.read_mode(addr))
@@ -600,16 +613,27 @@ class RadioSession:
             elif kind in ("freq", "mode"):
                 st = self._fenced_state(dec.state)
                 with self._rig_lock:
+                    old_mode = self.rig.mode, self.rig.data
                     changed = st != self.rig
                     self.rig = st
                 if changed:
                     self._emit("rig", st)
+                if (st.mode, st.data) != old_mode:
+                    self.dsp.clear()
+                    self._emit("dsp", {})
+                    if self.dsp_ready:
+                        self._read_dsp()
                 # (a key-down still waiting for its check is refused by _key_after_check)
                 if self._keyed and st.mode and st.data != (self._tx_kind == "data"):
                     self._unkey(reason=(
                         "Unkeyed: the radio left DATA mode (now %s)" % st.mode_label
                         if self._tx_kind == "data" else
                         "Unkeyed: the radio switched to %s while transmitting voice" % st.mode_label))
+            elif kind == "dsp" and self.dsp_supported:
+                name, setting = value
+                if name in civ.dsp_fields(self.rig.mode) and self.dsp.get(name) != setting:
+                    self.dsp[name] = setting
+                    self._emit("dsp", dict(self.dsp))
             elif kind == "ptt":
                 tx = value != 0
                 if tx != self.tx:
@@ -740,7 +764,11 @@ class RadioSession:
     def _apply(self, new_state, frames):
         self._require_on()
         with self._rig_lock:
+            mode_changed = (self.rig.mode, self.rig.data) != (new_state.mode, new_state.data)
             self.rig = new_state
+        if mode_changed and self.dsp_supported:
+            self.dsp.clear()
+            self._emit("dsp", {})
         self._emit("rig", new_state)
 
         def _send():
@@ -754,6 +782,8 @@ class RadioSession:
                     g = civ.read_group(f)
                     if g is not None:            # ignore replies to reads sent before this change
                         self._fence[g] = (self._reads_sent[g], deadline)
+                if mode_changed and self.dsp_ready:
+                    self._read_dsp()
         self._loop.call_soon_threadsafe(_send)
         return new_state
 
@@ -761,7 +791,7 @@ class RadioSession:
     def control_tune(self, freq_hz=None, mode=None, data=None, filt=None):
         """Validate and apply a complete service tuning request atomically."""
         self._require_on()
-        if self.ptt or self.tx or self._keyed or self._keying:
+        if self.ptt or self.tx or self._keyed or self._keying or self.low_tuning:
             raise PttRefused("the radio is transmitting")
         if self._tuning or self.tuner == civ.TUNER_TUNING:
             raise PttRefused("the antenna tuner is tuning")
@@ -814,6 +844,49 @@ class RadioSession:
         if not self.rig.mode:
             raise NotConnected("mode not known yet")
         return self.set_mode(self.rig.mode, self.rig.data, filt)
+
+    @property
+    def dsp_supported(self):
+        return self.info is not None and self.info.radio_name == "IC-7300MK2"
+
+    @property
+    def dsp_ready(self):
+        return (self.dsp_supported and self._connected and self.power == "on"
+                and not (self.ptt or self.tx or self._keyed or self._keying
+                         or self.low_tuning or self._tuning or self.tuner == civ.TUNER_TUNING))
+
+    def _read_dsp(self):
+        fields = civ.dsp_fields(self.rig.mode)
+        for name in civ.DSP_COMMANDS:
+            if name in fields:
+                self._tx_civ(civ.dsp_frame(self.civ_address, name))
+
+    @session_command
+    def set_dsp(self, name, value):
+        self._require_on()
+        if not self.dsp_supported:
+            raise ValueError("Receive DSP is not available on this radio")
+        if not self.dsp_ready:
+            raise PttRefused("Receive DSP can only be changed while receiving")
+        fields = civ.dsp_fields(self.rig.mode)
+        if name == "notch":
+            if value not in ("off", "auto_notch", "manual_notch") or (
+                    value != "off" and value not in fields):
+                raise ValueError("Notch mode is unavailable in this receive mode")
+            changes = [(key, 0) for key in ("auto_notch", "manual_notch")
+                       if key in fields and key != value]
+            if value != "off":
+                changes.append((value, 1))
+        else:
+            if name not in fields or name in ("auto_notch", "manual_notch"):
+                raise ValueError("Receive DSP control is unavailable in this mode")
+            if name in ("position", "width") and not self.dsp.get("manual_notch"):
+                raise ValueError("Select Manual Notch first")
+            changes = [(name, value)]
+        for key, setting in changes:
+            self._tx_civ(civ.dsp_frame(self.civ_address, key, setting))
+        for key, _ in changes:
+            self._tx_civ(civ.dsp_frame(self.civ_address, key))
 
     # ------------------------------------------------------------------ PTT
     # Safety rules
@@ -885,6 +958,11 @@ class RadioSession:
     def set_ptt(self, on, owner=None, reason=None, voice_ok=False):
         """Thread-safe. Raises PttRefused when keying isn't allowed.
         voice_ok: allow transmitting in a voice mode (GUI space bar only)."""
+        if self.low_tuning:
+            if on:
+                raise PttRefused("Low Power Tune is active")
+            self.stop_low_tune()
+            return
         if on:
             why = self.ptt_refusal(voice_ok)
             if why:
@@ -1034,6 +1112,9 @@ class RadioSession:
         if self._audio is not None:
             self._audio.require_audio = state == "on"
         if state == "standby":
+            self.stop_low_tune()
+            self.dsp.clear()
+            self._emit("dsp", {})
             self._rec_gap_pending = True
             self._unkey(reason="Unkeyed: the radio went to standby" if self._keyed else None)
             if self._tuning:
@@ -1050,6 +1131,8 @@ class RadioSession:
         for f in (civ.read_mode(a), civ.read_data_mode(a), civ.read_if_width(a), civ.read_ptt(a),
                   civ.read_rf_power(a), civ.read_tuner(a)):
             self._tx_civ(f)
+        if self.dsp_ready:
+            self._read_dsp()
         item = civ.model_info(radio_name).get("remote_power")
         if item is not None:
             v = await self._read_menu(item)
@@ -1076,6 +1159,9 @@ class RadioSession:
             raise NotConnected("the radio is not on")
 
         async def _do():
+            self.stop_low_tune()
+            if self._low_tune_task is not None:
+                await self._low_tune_task
             self._stop_tune()
             self._unkey()
             await self._finish_mod_setup()
@@ -1107,6 +1193,8 @@ class RadioSession:
     def set_rf_power(self, percent):
         """Thread-safe: RF power 0-100 %."""
         self._require_on()
+        if self.low_tuning:
+            raise PttRefused("RF power cannot be changed during Low Power Tune")
         level = int(round(max(0.0, min(100.0, float(percent))) * 255 / 100))
         self.rf_power = level
         self._rf_hold_until = time.monotonic() + RF_POWER_HOLD
@@ -1124,12 +1212,128 @@ class RadioSession:
         self._require_on()
         if not civ.has_tuner(self._model):
             raise PttRefused("TUNE: the %s has no antenna tuner command" % self._model)
-        if self.ptt or self._keyed:
+        if self.ptt or self._keyed or self.low_tuning:
             raise PttRefused("TUNE refused: transmitting")
         if self._tuning:
             return
         self._tuning = True
         self._loop.call_soon_threadsafe(self._start_tune)
+
+    @property
+    def low_tune_supported(self):
+        return self._model == "IC-7300MK2"
+
+    @property
+    def low_tuning(self):
+        return self._low_tune_task is not None
+
+    @session_command
+    def start_low_tune(self):
+        self._require_on()
+        if not self.low_tune_supported:
+            raise PttRefused("Low Power Tune is available on the IC-7300MK2")
+        if self.low_tuning or self.ptt or self.tx or self._keying or self._keyed:
+            raise PttRefused("Low Power Tune requires the radio to be receiving")
+        if self._tuning or self.tuner == civ.TUNER_TUNING or self._mods_ready is not True:
+            raise PttRefused("Wait for radio setup or antenna tuning to finish")
+        if not self.rig.data or self.rig.mode not in ("USB", "LSB"):
+            raise PttRefused("Select USB-D or LSB-D for Low Power Tune")
+        self._low_tune_stop = False
+        self._low_tune_task = self._loop.create_task(self._run_low_tune())
+        self._emit("low_tune", True)
+
+    @session_command
+    def stop_low_tune(self):
+        if self.low_tuning:
+            self._low_tune_stop = True
+            if self._low_tune_keyed:
+                self._tx_civ(civ.set_ptt(self.civ_address, False))
+
+    async def _run_low_tune(self):
+        a = self.civ_address
+        original = None
+        power_changed = False
+        status, severity = "Low Power Tune stopped", "info"
+        try:
+            mode = self.rig.mode
+            item = self.mods["data_mod"]["item"]
+            if item is None or await self._read_menu(item) != self._lan:
+                raise PttRefused("Low Power Tune requires DATA MOD set to LAN")
+            power = await self._civ_ask(civ.read_rf_power(a), lambda k, v: k == "rfpower")
+            if power is None:
+                raise PttRefused("Could not read the current RF power")
+            original = power[1]
+            if self._low_tune_stop:
+                return
+            power_changed = True
+            self._tx_civ(civ.set_rf_power(a, LOW_TUNE_POWER))
+            result = await self._civ_ask(civ.read_rf_power(a), lambda k, v: k == "rfpower")
+            if result is None or not 11 <= result[1] <= LOW_TUNE_POWER:
+                raise PttRefused("Radio did not confirm the 5% RF power setting")
+            mode_reply = await self._civ_ask(civ.read_mode(a), lambda k, v: k == "reply" and v == "mode")
+            confirmed = await self._civ_ask(civ.read_data_mode(a), lambda k, v: k == "reply" and v == "data")
+            if mode_reply is None or confirmed is None or not self.rig.data or self.rig.mode != mode:
+                raise PttRefused("Radio did not confirm SSB DATA mode")
+            rx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt")
+            if rx != ("ptt", 0) or self.tuner == civ.TUNER_TUNING:
+                raise PttRefused("Radio did not confirm receive")
+            if self._low_tune_stop:
+                return
+            if self._audio is None or self._audio.closed:
+                raise PttRefused("Low Power Tune requires the radio audio stream")
+
+            self._low_tune_keyed = True
+            deadline = self._loop.time() + LOW_TUNE_SECONDS
+            self._tx_civ(civ.set_ptt(a, True))
+            tx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt", attempts=1)
+            if self._low_tune_stop:
+                return
+            if tx != ("ptt", 1):
+                raise PttRefused("Radio did not confirm transmit")
+            self._status("Low Power Tune: 5% for up to 10 seconds")
+            # 20 ms at 48 kHz is exactly 20 periods. Repeating this buffer
+            # preserves phase. Fade the first and final 100 ms.
+            samples = np.arange(960)
+            tone = 4096 * np.sin(2 * np.pi * LOW_TUNE_TONE_HZ * samples / 48000)
+            elapsed = 0.0
+            while (not self._low_tune_stop and self._loop.time() < deadline
+                   and self.tx and self.rig.data and self.rig.mode == mode
+                   and self._audio is not None and not self._audio.closed):
+                remaining = deadline - self._loop.time()
+                gain = np.clip(np.minimum(elapsed + samples / 48000,
+                                          remaining - samples / 48000) / 0.1, 0, 1)
+                self._audio.send_frame((tone * gain).astype("<i2").tobytes())
+                await asyncio.sleep(min(0.02, max(0, deadline - self._loop.time())))
+                elapsed += 0.02
+            if not self._low_tune_stop and self._loop.time() >= deadline:
+                status = "Low Power Tune complete"
+        except PttRefused as exc:
+            status, severity = str(exc), "error"
+        except (StreamError, OSError):
+            log.exception("Low Power Tune connection failed")
+            status, severity = "Low Power Tune interrupted by a connection error", "error"
+        finally:
+            try:
+                received = not self._low_tune_keyed and not self.tx
+                if self._low_tune_keyed:
+                    for _ in range(2):
+                        self._tx_civ(civ.set_ptt(a, False))
+                        rx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt", attempts=1)
+                        if rx == ("ptt", 0):
+                            received = True
+                            break
+                if not received and power_changed:
+                    status, severity = "Could not confirm RX. RF power was not restored.", "error"
+                elif power_changed:
+                    self._tx_civ(civ.set_rf_power(a, original))
+                    restored = await self._civ_ask(civ.read_rf_power(a), lambda k, v: k == "rfpower")
+                    if restored != ("rfpower", original):
+                        status, severity = "Could not confirm original RF power was restored", "error"
+            finally:
+                self._low_tune_keyed = False
+                self._low_tune_task = None
+                self._emit("low_tune", False)
+                self._status(status, severity)
 
     def _start_tune(self):
         if self._tune_timer is not None:
@@ -1388,6 +1592,9 @@ class RadioSession:
             raise NotConnected("not connected to the radio")
 
         async def _do():
+            if self.low_tuning:
+                self.stop_low_tune()
+                await self._low_tune_task
             if self._keyed:
                 self._unkey(reason="Unkeyed: restoring DATA MOD")
             await self._finish_mod_setup()

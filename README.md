@@ -197,7 +197,7 @@ IC-7610 98h) force that address.
 - **Mode**: LSB, USB, AM, FM, plus **DATA** for the data variants (USB-D …).
 - **Filter**: FIL1/FIL2/FIL3, with the selected filter's passband shown next
   to them.
-- **Quick tune**: up to 10 buttons that set a stored frequency (mode and
+- **Quick tune**: up to 15 buttons that set a stored frequency (mode and
   filter stay as they are). They come from `quicktune.txt` in the app's
   settings folder, one `name, kHz` per line; names up to 10 characters,
   lines starting with `#` ignored. Without the file there are no buttons.

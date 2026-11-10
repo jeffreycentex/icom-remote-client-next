@@ -86,6 +86,10 @@ class IcomService:
     def set_filter(self, filt):
         return self.radio.control_tune(filt=filt)
 
+    @command
+    def set_dsp(self, name, value):
+        return self.radio.set_dsp(name, value)
+
     def set_ptt(self, on, owner=None, reason=None, voice_ok=False):
         # Safety controls go straight to the session owner, never behind a disk drain.
         return self.radio.set_ptt(on, owner=owner, reason=reason, voice_ok=voice_ok)
@@ -116,6 +120,12 @@ class IcomService:
     @command
     def power_off(self):
         return self.radio.power_off()
+
+    def start_low_tune(self):
+        return self.radio.start_low_tune()
+
+    def stop_low_tune(self):
+        return self.radio.stop_low_tune()
 
     @command
     def start_tuner(self):

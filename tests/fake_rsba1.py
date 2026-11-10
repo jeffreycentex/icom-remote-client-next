@@ -124,6 +124,7 @@ class FakeRadio:
         self.menu_ng = menu_ng               # radio that doesn't know these menu items
         self.menu_writes = []
         self.ptt = False
+        self.dsp = dict.fromkeys(civ.DSP_COMMANDS, 0)
         self.drop_next_rx_ptt_read = False
         self.ptt_log = []                    # (time, on)
         self.freq_log = []                   # (time, hz) of every frequency set
@@ -345,6 +346,14 @@ class FakeRadio:
         cmd, payload = f[4], f[5:-1]
         mk = lambda c, sub=None, data=b"": civ.frame(civ.CONTROLLER, c, sub, data, frm=a)
         echo = [f]                                  # radios echo the command on the LAN stream too
+        name = civ.DSP_FIELDS.get((cmd, payload[0])) if payload else None
+        if name is not None:
+            if len(payload) == 1:
+                value = self.dsp[name]
+                data = civ.encode_level(value) if civ.DSP_COMMANDS[name][2] == 255 else bytes([value])
+                return echo + [mk(cmd, payload[0], data)]
+            self.dsp[name] = civ.decode_level(payload[1:]) if len(payload) == 3 else payload[1]
+            return echo + [mk(civ.OK)]
         if cmd == 0x03:
             return echo + [mk(0x03, None, civ.encode_freq(self.freq_hz))]
         if cmd == 0x04:
