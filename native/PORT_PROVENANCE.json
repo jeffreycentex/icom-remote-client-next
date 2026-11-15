@@ -1,0 +1,49 @@
+{
+  "repository": "https://github.com/jeffreycentex/kiwisdr-remote-client",
+  "branch": "digitalmodes",
+  "tag": "v0.1",
+  "commit": "a28a9ad49066d64892ca7d6200066f6c39b2d997",
+  "note": "Python integration and helper filename adapted for Icom Remote Next. Pinned fldigi-core files are unchanged.",
+  "files": {
+    "build_decoder.py": {
+      "source": "build_decoder.py",
+      "source_sha256": "d046daae8a4d4b0f1eac74d1b62a0b57e162d1dbbc18a2bc70b884004e5b7462"
+    },
+    "icomremote/audiofile.py": {
+      "source": "kiwiremote/audiofile.py",
+      "source_sha256": "27cc0e9752c9389c258f0c1fce8178eecceebfe5dda5f1b6b5cd4f6fa78cc1c2"
+    },
+    "icomremote/digital.py": {
+      "source": "kiwiremote/digital.py",
+      "source_sha256": "3f9f7ad2b718d619214b199872eae3749588e02ae157f14c6bf0f652332b0374"
+    },
+    "icomremote/flamp.py": {
+      "source": "kiwiremote/flamp.py",
+      "source_sha256": "1e53711db3c43953363207d0e29fec1605f37985590d94c14d41a55f03c54cdc"
+    },
+    "icomremote/rsid.py": {
+      "source": "kiwiremote/rsid.py",
+      "source_sha256": "f973ad7bcd16c4424adc4c36ef9f32d9c554283c1ceb539271ec7b36e4a15e24"
+    },
+    "native/compat.h": {
+      "source": "native/compat.h",
+      "source_sha256": "c6ddd82090230df477ed431ae2a53cd8dfd168ddf2b3584198204f2e9a0ce82e"
+    },
+    "native/decoder_core.cpp": {
+      "source": "native/decoder_core.cpp",
+      "source_sha256": "43f75ff2c6866645b914234fbf8a2191eec7e8510d4058fee1462a1bd5031985"
+    },
+    "native/digital_decoder.cpp": {
+      "source": "native/digital_decoder.cpp",
+      "source_sha256": "ae866d914dc67702d4cea17ffb8383ba1001fdf05b652297b9921757a19f2d37"
+    },
+    "tests/test_digital.py": {
+      "source": "tests/test_digital.py",
+      "source_sha256": "3bc30bd6f2abd1138728fd5ae9a60b004615df8c88ca37054ceb1a908689a31e"
+    },
+    "tests/test_flamp.py": {
+      "source": "tests/test_flamp.py",
+      "source_sha256": "9ae2547d898903fd90143e76ffb49c15867e3920c93f23607a0508c9f8f622b5"
+    }
+  }
+}

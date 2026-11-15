@@ -1,0 +1,455 @@
+"""Create a browser include overlay; upstream decoder sources remain unchanged."""
+from pathlib import Path
+import json
+import re
+import shutil
+
+ROOT = Path(__file__).resolve().parents[1]
+UPSTREAM = ROOT / "vendor/fldigi/src"
+GENERATED = ROOT / "build/generated"
+SOURCES = [
+    "filters/filters.cxx", "filters/fftfilt.cxx", "filters/viterbi.cxx",
+    "psk/psk.cxx", "psk/pskcoeff.cxx", "psk/pskvaricode.cxx", "psk/pskeval.cxx", "psk/viewpsk.cxx",
+    "mfsk/interleave.cxx", "mfsk/mfskvaricode.cxx",
+    "dominoex/dominoex.cxx", "dominoex/dominovar.cxx", "throb/throb.cxx",
+    "mt63/dsp.cxx", "mt63/mt63base.cxx", "mt63/mt63.cxx",
+    "olivia/olivia.cxx", "contestia/contestia.cxx", "rtty/rtty.cxx",
+    "cw/cw.cxx", "cw/morse.cxx", "mfsk/mfsk.cxx", "thor/thor.cxx", "thor/thorvaricode.cxx", "misc/misc.cxx",
+    "scamp/scamp.cxx", "scamp/scamp_protocol.cxx", "ifkp/ifkp.cxx", "feld/feld.cxx", "feld/feldfonts.cxx", "misc/re.cxx",
+    "navtex/navtex.cxx", "fsq/fsq.cxx",
+    "wefax/wefax.cxx", "misc/strutil.cxx",
+    "misc/charsetdistiller.cxx", "libtiniconv/tiniconv.c", "libtiniconv/tiniconv_desc.c", "dtmf/dtmf.cxx",
+]
+HEADERS = "globals.h complex.h misc.h ascii.h filters.h fftfilt.h gfft.h viterbi.h psk.h pskcoeff.h pskvaricode.h pskeval.h viewpsk.h mfskvaricode.h interleave.h dominoex.h dominovar.h throb.h mbuffer.h dsp.h mt63.h mt63base.h olivia.h contestia.h rtty.h cw.h morse.h mfsk.h thor.h thorvaricode.h scamp.h scamp_protocol.h ifkp.h feld.h fontdef.h re.h navtex.h fsq.h crc8.h wefax.h strutil.h".split()
+
+
+def prepare_cw_receiver(text, header):
+    """Keep CW envelope detection and reset state independent of carrier phase."""
+    state_marker = 'int\t\t\tsymbollen;'
+    if header.count(state_marker) != 1:
+        raise ValueError('The upstream CW state declaration changed.')
+    header = header.replace(state_marker, 'double webEnvelopePower = 0;\n    int webEnvelopeCount = 0;\n    bool webSpaceSent = true;\n    int webLastElement = 0;\n\t' + state_marker)
+    changes = [
+        ('cw::cw() : modem()\n{', 'cw::cw() : modem()\n{\n    first_time = true;'),
+        ('void cw::rx_init()\n{', 'void cw::rx_init()\n{\n    webEnvelopePower = 0;\n    webEnvelopeCount = 0;\n    webSpaceSent = true;\n    webLastElement = 0;'),
+        ('static int space_sent = true;', 'bool& space_sent = webSpaceSent;'),
+        ('static int last_element = 0;', 'int& last_element = webLastElement;'),
+        ('n = cw_filter->Irun(fil_in, fil_out);', """cw_filter->Irun(fil_in, fil_out);
+        webEnvelopePower += fil_out * fil_out;
+        n = ++webEnvelopeCount == FIR_DECIMATE;
+        if (n) {
+            fil_out = sqrt(webEnvelopePower / FIR_DECIMATE);
+            webEnvelopePower = 0;
+            webEnvelopeCount = 0;
+        }""")
+    ]
+    for old, new in changes:
+        if text.count(old) != 1:
+            raise ValueError('The upstream CW receive implementation changed: ' + old)
+        text = text.replace(old, new)
+    # Measure the full-rate filtered envelope before downsampling its power.
+    # Decimating a real 800 Hz carrier by ten at 8 kHz can sample only its zeros.
+    marker = 'init_bandpass(FIR_FILTER_LEN, FIR_DECIMATE,'
+    if text.count(marker) != 2:
+        raise ValueError('The upstream CW bandpass initialization changed.')
+    text = text.replace(marker, 'init_bandpass(FIR_FILTER_LEN, 1,')
+    return text, header
+
+
+def bootstrap_scamp_receiver(text, header):
+    """Acquire the first sync before the native level estimator has warmed up.
+
+    OOK's first level average takes 8.192 seconds; fast FSK takes 1.024 seconds.
+    Their sync words arrive before that estimate is usable on a fresh receiver.
+    Use an eight-symbol rolling channel peak during acquisition while the native
+    long-term estimator runs, then return to native control after first sync.
+    The window is longer than a legal OOK off-run but ages out preceding bursts.
+    """
+    state_marker = '    scamp_state sc;'
+    init_marker = '\tsc.protocol = protocol;'
+    decode_marker = '\tscamp_new_sample(&sc, imag1, imag2);'
+    for source, marker in [(header, state_marker), (text, init_marker), (text, decode_marker)]:
+        if source.count(marker) != 1:
+            raise ValueError('The upstream SCAMP receiver bootstrap markers changed.')
+    header = header.replace(state_marker, state_marker + '''
+    // Browser adaptation: retain acquisition levels until the first sync.
+    bool webStartupThreshold;
+    uint16_t webStartupMagnitudes[8 * SCAMP_MAX_DEMODBUFFER];
+    uint16_t webStartupIndex;''')
+    text = text.replace(init_marker, init_marker + '''
+    webStartupThreshold = protocol == PROTOCOL_SCAMP_OOK || protocol == PROTOCOL_SCAMP_FSK_FAST;
+    memset(webStartupMagnitudes, 0, sizeof(webStartupMagnitudes));
+    webStartupIndex = 0;''')
+    text = text.replace(decode_marker, '''    // Browser adaptation: do not clock the first preamble with zero edge thresholds.
+    if (webStartupThreshold) {
+        const uint16_t magnitude = imag1 > imag2 ? imag1 : imag2;
+        const uint16_t window = 8 * sc.demod_samples_per_bit;
+        webStartupMagnitudes[webStartupIndex] = magnitude;
+        if (++webStartupIndex >= window) webStartupIndex = 0;
+        uint16_t edge = 0;
+        for (uint16_t index = 0; index < window; index++) {
+            if (webStartupMagnitudes[index] > edge) edge = webStartupMagnitudes[index];
+        }
+        if (!sc.fsk) edge >>= 2;
+        const uint16_t minimumEdge = sc.fsk ? sc.power_thr_min : sc.power_thr_min >> 1;
+        sc.edge_thr = edge > minimumEdge ? edge : minimumEdge;
+        sc.power_thr = sc.fsk ? sc.edge_thr >> 1 : sc.edge_thr;
+        sc.squelch_thr = sc.fsk ? sc.power_thr : sc.power_thr >> 1;
+    }
+    scamp_new_sample(&sc, imag1, imag2);
+    if (sc.resync) webStartupThreshold = false;''')
+    return text, header
+
+
+def retain_thor_picture_history(text, header):
+    """Replay a recent image marker when interleaved text identifies it late.
+
+    THOR25 can deliver its picture header after the marker and first pixels.
+    Retain two seconds per receiver and replay only a coherent 200 ms run at
+    the protocol's out-of-band marker frequency. Otherwise retain native RX.
+    """
+    header_marker = '\tstd::string\t\tpic_str;'
+    init_marker = 'void thor::rx_init()\n{'
+    loop_marker = '\twhile (len) {\n\t\tif (state != TEXT) {'
+    parse_marker = '\tstate = IMAGE_START;\n}'
+    sync_marker = '\t\tif (sync > -0.5 * bandwidth) {//-0.51 * bandwidth) {\n\t\t\tstate = IMAGE;'
+    method_marker = 'void thor::parse_pic(int ch)'
+    for source, marker in [(header, header_marker), (text, init_marker),
+                           (text, loop_marker), (text, parse_marker), (text, sync_marker), (text, method_marker)]:
+        if source.count(marker) != 1:
+            raise ValueError('The upstream THOR picture-history markers changed.')
+    header = '#include "web_thor_picture.h"\n' + header
+    header = header.replace(header_marker, header_marker + '''
+    ThorPictureHistory webPictureHistory;
+    bool webPictureMarkerVerified = false;
+    void recoverPictureHistory();''')
+    text = text.replace(init_marker, init_marker + '\n    webPictureHistory.reset(samplerate);\n    webPictureMarkerVerified = false;')
+    text = text.replace(loop_marker, '\twhile (len) {\n        webPictureHistory.push(*buf);\n\t\tif (state != TEXT) {')
+    text = text.replace(parse_marker, '\tstate = IMAGE_START;\n    webPictureMarkerVerified = false;\n    recoverPictureHistory();\n}')
+    text = text.replace(sync_marker, '''\t\tif (sync > -0.5 * bandwidth) {
+            if (!webPictureMarkerVerified && webPictureHistory.findMarker(samplerate, frequency - 0.6 * bandwidth, 512) < 0) {
+                state = IMAGE_START;
+                return;
+            }
+            webPictureMarkerVerified = true;
+            state = IMAGE;''')
+    recovery = '''void thor::recoverPictureHistory()
+{
+    const int start = webPictureHistory.findMarker(samplerate, frequency - 0.6 * bandwidth);
+    if (start < 0) return;
+    webPictureMarkerVerified = true;
+    picfilter->init_lowpass(257, 1, 1.0 * bandwidth / samplerate);
+    prevz = cmplx(0.0, 0.0);
+    img_phase = 0.0;
+    image_counter = -(257 + IMAGEspp * 2);
+    for (int index = start; index < webPictureHistory.size() && state != TEXT; index++) {
+        recvpic(webPictureHistory.sample(index));
+    }
+}
+
+'''
+    return text.replace(method_marker, recovery + method_marker), header
+
+
+def calibrate_fsq_image(text):
+    """Keep the FSQ image preroll continuous and invert its native FM scale."""
+    marker = 'byte = pixel / 1.5 + 128;'
+    if text.count(marker) != 1:
+        raise ValueError('The upstream FSQ image level conversion changed.')
+    text = text.replace(marker, 'byte = (pixel + 200.0) / 1.5;')
+    start = text.index('void fsq::send_image()')
+    end = text.index('if (color == false)', start)
+    preamble = text[start:end]
+    marker = 'ModulateXmtr(outbuf, 10);'
+    if preamble.count(marker) != 1:
+        raise ValueError('The upstream FSQ image preroll changed.')
+    preamble = preamble.replace(marker, 'ModulateXmtr(outbuf, PHASE_CORR);')
+    return text[:start] + preamble + text[end:]
+
+
+def stream_image(text, family):
+    """Yield image modulation in small batches, retaining upstream DSP code.
+
+    Desktop send_image runs a whole image on its transmit thread. A worker
+    needs resumable pixel iteration so realtime TX has bounded lookahead.
+    Keep the original preamble and pixel modulation statements verbatim.
+    """
+    start = text.index(f'void {family}::send_image()')
+    end_marker = {'thor': 'void thor::thor_send_image', 'ifkp': 'std::string img_str;', 'fsq': 'void fsq::send_string'}[family]
+    end = text.index(end_marker, start)
+    original = text[start:end]
+    condition = {'thor': 'if (send_gray)', 'ifkp': 'if (send_color == false)', 'fsq': 'if (color == false)'}[family]
+    split = original.index(condition)
+    preamble_start = original.index('\tREQ(')
+    head = original[:preamble_start]
+    preamble = original[preamble_start:split]
+    pixel_start = original.rindex('tx_pixelnbr = col + row * W;')
+    modulation_end = re.search(r'(?:ModulateXmtr|transmit)\(outbuf, (?:IMAGEspp|10)\);', original[pixel_start:]).end() + pixel_start
+    pixel = original[pixel_start:modulation_end]
+    pixel = pixel.replace(f'tx_pixel = {family}pic_TxGetPixel(tx_pixelnbr, color);', f'''tx_pixel = gray ?
+            0.3 * {family}pic_TxGetPixel(tx_pixelnbr, 0) +
+            0.6 * {family}pic_TxGetPixel(tx_pixelnbr, 1) +
+            0.1 * {family}pic_TxGetPixel(tx_pixelnbr, 2) :
+            {family}pic_TxGetPixel(tx_pixelnbr, color);''')
+    gray = {'thor': 'send_gray', 'ifkp': '!send_color', 'fsq': '!color'}[family]
+    channel = '2 - (web_image_position / W) % 3' if family == 'fsq' else '(web_image_position / W) % 3'
+    replacement = head + '\nif (web_image_position == 0) {\n' + preamble + '\n}\n' + f'''
+    const bool gray = {gray};
+    const int channels = gray ? 1 : 3;
+    const int total = W * H * channels;
+    const int limit = std::min(total, web_image_position + 128);
+    for (; web_image_position < limit; ++web_image_position) {{
+        int row = web_image_position / (W * channels);
+        int col = web_image_position % W;
+        int color = gray ? 0 : {channel};
+        {pixel}
+    }}
+    web_image_done = web_image_position == total;
+    if (web_image_done) start_deadman();
+}}
+
+'''
+    # Desktop text tones already use the TX carrier. Keep image FM on that
+    # same carrier when the browser's frequency lock / offset is configured.
+    replacement = re.sub(r'\bfrequency\b', 'get_txfreq_woffset()', replacement)
+    text = text[:start] + replacement + text[end:]
+    if family == 'thor':
+        text = text.replace('case TX_STATE_IMAGE:\n', 'case TX_STATE_IMAGE:\n\t\tif (web_image_position == 0) {\n')
+        text = text.replace('\t\tsend_image();', '\t\t}\n\t\tsend_image();\n\t\tif (!web_image_done) return 0;', 1)
+    elif family == 'ifkp':
+        text = text.replace('\t\t\tsend_image();', '\t\t\tsend_image();\n\t\t\tif (!web_image_done) return 0;', 1)
+    else:
+        text = text.replace('int fsq::tx_process()\n{', '''int fsq::tx_process()
+{
+    if (fsq_tx_image && web_image_position > 0) {
+        send_image();
+        if (!web_image_done) return 0;
+        flush_buffer();
+        fsq_tx_image = false;
+        stopflag = false;
+        return -1;
+    }''')
+        text = text.replace('\t\tsend_eot = false;', '\t\tsend_eot = false;\n\t\tif (fsq_tx_image && !web_image_done) return 0;', 1)
+    return text
+
+
+def stream_fax(text):
+    # Retain the native APT/phasing/image/stop state machine and FM modulator;
+    # Persist its sample cursor and yield after 32 native 256-sample buffers.
+    text = text.replace('fax_state m_tx_state;', 'int m_web_tx_sample_idx = 0;\n\tfax_state m_tx_state;')
+    text = text.replace('void init_tx(int the_smpl_rate);', 'bool web_tx_idle() const { return m_tx_state == IDLE; }\n\tvoid init_tx(int the_smpl_rate);')
+    text = text.replace('m_tx_state = TXAPTSTART;', 'm_tx_state = TXAPTSTART;\n\tm_web_tx_sample_idx = 0;')
+    start = text.index('bool fax_implementation::trx_do_next(void)')
+    end = text.index('void fax_implementation::tx_params_set', start)
+    body = text[start:end]
+    body = body.replace('int curr_sample_idx = 0 , nb_samples_to_send  = 0 ;', 'int &curr_sample_idx = m_web_tx_sample_idx;\n\tint nb_samples_to_send = 0;')
+    body = body.replace('for (int num_bytes_to_write = 0; ; ++num_bytes_to_write)', 'int num_bytes_to_write = 0;\n\tfor (; ; ++num_bytes_to_write)')
+    body = body.replace('bool end_of_loop = false ;', 'int web_blocks = 0;\n\tbool end_of_loop = false ;')
+    body = body.replace('num_bytes_to_write = 0 ;', 'num_bytes_to_write = 0;\n\t\t\tif (++web_blocks == 32) { delete [] buf; return true; }')
+    body = body.replace('m_tx_state = TXBLACK;\n\t\t\t\tcurr_sample_idx = 0;\n\t\t\t\tcontinue;', 'm_tx_state = TXBLACK;\n\t\t\t\tcurr_sample_idx = 0;\n\t\t\t\t--num_bytes_to_write;\n\t\t\t\tcontinue;')
+    body = body.replace('m_tx_state = IDLE;\n\t\t\t\tend_of_loop = true ;\n\t\t\t\tcontinue ;', 'm_tx_state = IDLE;\n\t\t\t\tend_of_loop = true;\n\t\t\t\tbreak;')
+    # The final incomplete block belongs to the tail; desktop discards it.
+    body = body.replace('} // loop\n\tdelete [] buf;', '} // loop\n\tif (num_bytes_to_write > 0) modulate(buf, num_bytes_to_write);\n\tdelete [] buf;')
+    text = text[:start] + body + text[end:]
+    text = text.replace('bool tx_was_completed = m_impl->trx_do_next();', 'bool tx_was_completed = m_impl->trx_do_next();\n\tif (tx_was_completed && !m_impl->web_tx_idle()) return 0;')
+    return text
+
+
+def elements(text):
+    text = text.replace("\\\n", " ")
+    for match in re.finditer(r"ELEM_\(", text):
+        start = match.end(); depth = 0; quoted = False; escaped = False; args = []; last = start
+        for i in range(start, len(text)):
+            c = text[i]
+            if quoted:
+                if escaped: escaped = False
+                elif c == "\\": escaped = True
+                elif c == '"': quoted = False
+            elif c == '"': quoted = True
+            elif c == "(": depth += 1
+            elif c == ")":
+                if depth == 0:
+                    args.append(text[last:i].strip()); break
+                depth -= 1
+            elif c == "," and depth == 0:
+                args.append(text[last:i].strip()); last = i + 1
+        if len(args) == 5 and re.fullmatch(r"\w+", args[1]): yield args
+
+
+def main():
+    inc = GENERATED / "include"; inc.mkdir(parents=True, exist_ok=True)
+    for name in HEADERS:
+        shutil.copyfile(UPSTREAM / "include" / name, inc / name)
+    # Keep the upstream DTMF DSP/debounce algorithm; make stream state belong
+    # to the receiver instance and release its filters on mode/source resets.
+    dtmf = (UPSTREAM / 'include/dtmf.h').read_text(encoding='utf-8')
+    dtmf = dtmf.replace('NUMTONES', 'DTMF_NUMTONES')
+    dtmf = dtmf.replace('int framesize;', 'int framesize;\n\tsize_t dptr = 0;')
+    dtmf = dtmf.replace('~cDTMF() {};', '~cDTMF() { for (auto filter : filt) delete filter; };')
+    dtmf = dtmf.replace('void receive(const float* buf, size_t len);', 'void receive(const float* buf, size_t len);\n\tvoid flush();')
+    dtmf = dtmf.replace('void send();', 'void send(int tone_ms = 50, int gap_ms = 50);')
+    (inc / 'dtmf.h').write_text(dtmf, encoding='utf-8')
+    shutil.copyfile(UPSTREAM / 'include/charsetdistiller.h', inc / 'charsetdistiller.h')
+    shutil.copyfile(UPSTREAM / 'libtiniconv/tiniconv.h', inc / 'tiniconv.h')
+    # Preserve fldigi's quality buckets and clamped circular history verbatim.
+    base = (UPSTREAM / 'trx/modem.cxx').read_text()
+    quality = re.search(r'int modem::get_quality\(int mode\).*?return get_quality\(mode\);\s*}', base, re.S).group(0)
+    (inc / 'web_modem_quality.h').write_text(quality + '\n')
+    # Preserve the native signal ramps and output limiter, replacing only the
+    # sound-card write. Hardware PTT/auxiliary channels remain desktop-only.
+    modulation = base[base.index('void modem::ModulateXmtr'):]
+    envelope = modulation[modulation.index('\tint num ='):modulation.index('\tif (progdefaults.PTTrightchannel)')]
+    level = modulation[modulation.index('\tdouble mult ='):modulation.index('\n\ttry {')]
+    transmit = 'void modem::ModulateXmtr(double* buffer,int len) {\nif(!buffer||len<1)return;\ntx_sample_rate=samplerate;tx_sample_count+=len;\nconst double SIGLIMIT=0.95;\n' + envelope + level + '\nweb_tx_audio(buffer,len);\n}\n'
+    (inc / 'web_modem_transmit.h').write_text(transmit)
+    (inc / 're.h').write_text((inc / 're.h').read_text().replace('"compat/regex.h"','<regex.h>'))
+    shutil.copytree(UPSTREAM / "include/jalocha", inc / "jalocha", dirs_exist_ok=True)
+    modem = (UPSTREAM / "include/modem.h").read_text(encoding="utf-8", errors="replace")
+    modem = re.sub(r'^#include "(?:threads|sound|digiscope|plot_xy)\.h"', '#include "web_compat.h"', modem, flags=re.M)
+    (inc / "modem.h").write_text(modem)
+    # Desktop-facing headers resolve to a small explicit browser adapter.
+    includes = set()
+    combined = ""
+    for name in SOURCES:
+        text = (UPSTREAM / name).read_text(encoding="utf-8", errors="replace")
+        if name == 'scamp/scamp_protocol.cxx':
+            header_path = inc / 'scamp_protocol.h'
+            text, header = bootstrap_scamp_receiver(text, header_path.read_text(encoding='utf-8'))
+            header_path.write_text(header, encoding='utf-8')
+        if name == 'dtmf/dtmf.cxx':
+            text = text.replace('#include <samplerate.h>', '') # Unused native backend header.
+            text = text.replace('#include "dtmf.h"', '#include "modem.h"\n#include "dtmf.h"').replace('NUMTONES', 'DTMF_NUMTONES')
+            # The native copy loop can retain dptr == framesize and then read
+            # beyond a short next chunk. Assemble complete frames explicitly.
+            start = text.index('\tint x;', text.index('void cDTMF::receive'))
+            end = text.index('\t\tx = decode();', start) + len('\t\tx = decode();')
+            text = text[:start] + '''\tif (!progdefaults.DTMFdecode || !buf || !len) return;
+\tframesize = (active_modem->get_samplerate() == 8000) ? 240 : 331;
+\tsize_t bufptr = 0;
+\twhile (bufptr < len) {
+\t\tdata[dptr++] = buf[bufptr++];
+\t\tif (dptr < size_t(framesize)) continue;
+\t\tdptr = 0;
+\t\tint x = decode();''' + text[end:]
+            text = text.replace('REQ(showDTMF, dtmfchars);', 'showDTMF(dtmfchars);')
+            # Expose tone and gap timing without changing upstream synthesis.
+            # Bounds fit its 16384-sample buffer and the 4 ms shaped edges.
+            text = text.replace('void cDTMF::send()', 'void cDTMF::send(int tone_ms, int gap_ms)')
+            text = text.replace('duration = 50;', 'duration = clamp(tone_ms, 40, 2000);\n\tgap_ms = clamp(gap_ms, 30, 2000);')
+            text = text.replace('\t\tsilence(duration);\n\t}', '\t\tsilence(gap_ms);\n\t}')
+            text = text.replace('if (maxpower <', 'active_modem->display_metric(clamp(maxpower / 10.0, 0.0, 100.0));\n\tif (maxpower <')
+            text += '\nvoid cDTMF::flush() { if (!dtmfchars.empty()) { showDTMF(dtmfchars); dtmfchars.clear(); } }\n'
+            (GENERATED / 'dtmf.cxx').write_text(text, encoding='utf-8')
+        if name == 'cw/cw.cxx':
+            header_path = inc / 'cw.h'
+            text, header = prepare_cw_receiver(text, header_path.read_text(encoding='utf-8'))
+            header_path.write_text(header, encoding='utf-8')
+            # Serial keying and its native background threads follow the DSP implementation.
+            text = text[:text.index('Cserial CW_KEYLINE_serial;')]
+            text += '\nvoid cw::send_CW(int) {}\n'
+        if name in ['mfsk/mfsk.cxx', 'thor/thor.cxx', 'ifkp/ifkp.cxx']:
+            text = re.sub(r'#include "(?:mfsk|thor|ifkp)-pic.cxx"', '#include "web_picture.h"', text)
+        if name == 'mfsk/mfsk.cxx':
+            text = text.replace('int i = 0;\n\t\t\tint blocklen = 128;', 'int &i = web_image_position;\n\t\t\tint blocklen = 128;')
+            text = text.replace('while (i < xmtbytes)', 'if (i < xmtbytes)')
+            text = text.replace('\t\t\t\ti += blocklen;\n\t\t\t}', '\t\t\t\ti = std::min(xmtbytes, i + blocklen);\n\t\t\t}\n\t\t\tif (i < xmtbytes) return 0;\n\t\t\tweb_image_done = true;')
+        if name in ['thor/thor.cxx', 'ifkp/ifkp.cxx', 'fsq/fsq.cxx']:
+            if name == 'fsq/fsq.cxx':
+                text = calibrate_fsq_image(text)
+            text = stream_image(text, Path(name).stem)
+        if name == 'ifkp/ifkp.cxx':
+            text = text.replace('frequency = (basetone + tone * IFKP_SPACING) * samplerate / symlen;', 'frequency = (basetone + tone * IFKP_SPACING) * samplerate / symlen - progdefaults.TxOffset;')
+            text = text.replace('#include "ifkp_varicode.cxx"', (UPSTREAM / 'ifkp/ifkp_varicode.cxx').read_text())
+            text = text[:text.index('static picture *def_ifkp_avatar')] + '\nvoid ifkp::m_ifkp_send_avatar() {}\n' + text[text.index('int ifkp::tx_process'):]
+            text += '\nstd::string ifkp::imageheader;\n'
+        if name == 'feld/feld.cxx':
+            text = text.replace('REQ(put_rx_data,', 'put_rx_data(')
+        if name == 'navtex/navtex.cxx':
+            # Native station catalogs, ADIF/KML integrations do not participate in DSP.
+            text = text[:text.index('class NavtexRecord')] + text[text.index('}; // NavtexCatalog')+len('}; // NavtexCatalog'):]
+            start=text.index('void display( const std::string & alt_string )')
+            end=text.index('} // display',start)+len('} // display')
+            text=text[:start]+'void display(const std::string &alt_string){std::string::operator=(alt_string);cleanup();}\n'+text[end:]
+        if name == 'fsq/fsq.cxx':
+            text = text.replace('freq = (tx_basetone + tone * spacing) * samplerate / FSQ_SYMLEN;', 'freq = (tx_basetone + tone * spacing) * samplerate / FSQ_SYMLEN - progdefaults.TxOffset;')
+            text=text.replace('#include "fsq-pic.cxx"','#include "web_picture.h"')
+            text=text.replace('#include "fsq_varicode.cxx"',(UPSTREAM/'fsq/fsq_varicode.cxx').read_text())
+            text=text[:text.index('void  clear_xmt_arrays()\n{')]+'\nvoid fsq::reply(std::string){}\nvoid fsq::delayed_reply(std::string,int){}\nvoid fsq::start_aging(){}\nvoid fsq::stop_aging(){}\nvoid fsq::start_sounder(int){}\nvoid SOUNDER_close(){}\n'
+        if name == 'wefax/wefax.cxx':
+            text = stream_fax(text)
+            text=text.replace('#include "wefax-pic.h"','#include "web_wefax.h"')
+            start=text.index('void wefax::qso_rec_save(void)');end=text.index('void wefax::set_freq(double freq)',start)
+            text=text[:start]+'void wefax::qso_rec_save(void){}\n'+text[end:]
+        if name in ['mfsk/mfsk.cxx','thor/thor.cxx','ifkp/ifkp.cxx','fsq/fsq.cxx','wefax/wefax.cxx']:
+            callbacks=['showRxViewer','updateRxPic','thor_showRxViewer','thor_clear_avatar','thor_updateRxPic','thor_update_avatar','ifkp_showRxViewer','ifkp_clear_avatar','ifkp_updateRxPic','ifkp_update_avatar','fsq_showRxViewer','fsq_updateRxPic','wefax_pic::resize_rx_viewer','wefax_pic::update_rx_pic_bw']
+            for callback in callbacks:
+                text=re.sub(r'REQ\(\s*'+re.escape(callback)+r'\s*,',callback+'(',text)
+                text=re.sub(r'REQ\(\s*'+re.escape(callback)+r'\s*\)',callback+'()',text)
+        if name == 'misc/misc.cxx':
+            text = text[:text.index('#include')] + '#include "misc.h"\n' + text[text.index('unsigned char grayencode'):]
+        if name == 'thor/thor.cxx':
+            header_path = inc / 'thor.h'
+            text, header = retain_thor_picture_history(text, header_path.read_text(encoding='utf-8'))
+            header_path.write_text(header, encoding='utf-8')
+            text += '\nstd::string thor::imageheader;\nstd::string thor::avatarheader;\nint thor::IMAGEspp=THOR_IMAGESPP;\n'
+        if name in ['cw/cw.cxx', 'mfsk/mfsk.cxx', 'thor/thor.cxx', 'misc/misc.cxx', 'ifkp/ifkp.cxx', 'feld/feld.cxx', 'navtex/navtex.cxx', 'fsq/fsq.cxx', 'wefax/wefax.cxx', 'scamp/scamp_protocol.cxx']:
+            (GENERATED / Path(name).name).write_text(text, encoding='utf-8')
+        combined += text
+        includes.update(re.findall(r'^#include [<"]([^>"\n]+)[>"]', text, re.M))
+    for name in HEADERS:
+        includes.update(re.findall(r'^#include [<"]([^>"\n]+)[>"]', (inc / name).read_text(encoding="utf-8", errors="replace"), re.M))
+    for name in includes:
+        if name in HEADERS or name in ['modem.h', 'dtmf.h', 'charsetdistiller.h', 'tiniconv.h'] or name.startswith("jalocha/"): continue
+        if name.startswith("FL/") or (UPSTREAM / "include" / name).exists():
+            target = inc / name; target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('#pragma once\n#include "web_compat.h"\n')
+    (inc / "config.h").write_text('#pragma once\n#define BENCHMARK_MODE 0\n#define HAVE_STD_BIND 1\n#define HAVE_STD_HASH 1\n#define HAVE_CLOCK_GETTIME 1\n#include "web_compat.h"\n')
+    combined = re.sub(r'/\*.*?\*/|//[^\n]*', '', combined, flags=re.S)
+    fields = set(re.findall(r"progdefaults\.(\w+)", combined))
+    fields.update(['wfPreFilter', 'wf_latency', 'TxOffset', 'SoftStart'])
+    values = {a[1]: a for a in elements((UPSTREAM / "include/configuration.h").read_text(encoding="utf-8", errors="replace"))}
+    config = ['#pragma once', 'struct WebConfiguration {']
+    for name in sorted(fields):
+        if name not in values: raise RuntimeError(f"No upstream default for {name}")
+        kind, _, _, _, default = values[name]
+        default = default.replace('rtty::RTTY_PARITY_NONE', '0')
+        config.append(f"    {kind} {name} = {default};")
+    config.append('};\nextern WebConfiguration progdefaults;\n')
+    (inc / "web_configuration.h").write_text("\n".join(config))
+    status_fields = set(re.findall(r"progStatus\.(\w+)", combined))
+    status_fields.add('txlevel')
+    status_text = (UPSTREAM / "include/status.h").read_text(encoding="utf-8", errors="replace")
+    status = ['#pragma once', 'struct WebStatus {']
+    for name in sorted(status_fields):
+        match = re.search(r"\b(bool|double|float|int|std::string)\s+" + name + r"\s*;", status_text)
+        if not match: raise RuntimeError(f"No status type for {name}")
+        status.append(f"    {match[1]} {name} {{}};")
+    status.append('};\nextern WebStatus progStatus;\n')
+    (inc / "web_status.h").write_text("\n".join(status))
+    # Preserve upstream mode names and ordering, without native modem globals.
+    source = (UPSTREAM / "globals/globals.cxx").read_text(encoding="utf-8", errors="replace")
+    table = re.search(r"const struct mode_info_t mode_info\[NUM_MODES\] = \{(.*?)\n\};", source, re.S).group(1)
+    table = re.sub(r'/\*.*?\*/|//[^\n]*', '', table, flags=re.S)
+    rows = re.findall(r'\{\s*(MODE_\w+)\s*,\s*&([\w]+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"', table)
+    families = {}
+    for mode, pointer, short, label in rows:
+        family = None
+        for key, pattern in [('PSK', r'psk|ofdm'), ('DominoEX', r'dominoex'), ('Throb', r'throb'), ('MT63', r'mt63'), ('Olivia', r'olivia'), ('Contestia', r'contestia'), ('RTTY', r'^rtty'), ('CW', r'^cw_'), ('MFSK', r'^mfsk'), ('THOR', r'^thor'), ('SCAMP', r'^sc(?:amp|fsk|ook)'), ('IFKP', r'^ifkp'), ('Hellschreiber', r'^feld'), ('NAVTEX', r'navtex|sitorb'), ('FSQ', r'^fsq'), ('WEFAX',r'^wefax')]:
+            if re.search(pattern, pointer): family = key; break
+        families[mode] = family
+    cpp = ['#include "web_compat.h"', 'const struct mode_info_t mode_info[NUM_MODES] = {']
+    table = re.sub(r"&\w+", "nullptr", table)
+    table = re.sub(r"\b(?:DISABLED_IO|ARQ_IO|KISS_IO)\b", "0", table)
+    cpp += [table, '};', 'const char* web_family(int mode) { switch(mode) {']
+    for mode, family in families.items():
+        if family: cpp.append(f'case {mode}: return "{family}";')
+    cpp += ['case WEB_MODE_DTMF: return "DTMF";', 'default: return ""; }}']
+    (GENERATED / "mode_table.cpp").write_text("\n".join(cpp))
+    (GENERATED / "sources.json").write_text(json.dumps(SOURCES, indent=2))
+    viewer = (UPSTREAM / 'psk/viewpsk.cxx').read_text(encoding='utf-8')
+    viewer = viewer.replace('REQ(&viewaddchr,', 'viewaddchr(').replace('REQ(&viewclearchannel,', 'viewclearchannel(')
+    (GENERATED / 'viewpsk.cxx').write_text(viewer, encoding='utf-8')
+    print(f"Browser overlay prepared; {len(fields)} original configuration defaults, {sum(bool(v) for v in families.values())} receive modes.")
+
+
+if __name__ == '__main__': main()

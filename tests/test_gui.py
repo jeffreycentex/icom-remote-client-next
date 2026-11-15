@@ -61,6 +61,64 @@ class TestGui(unittest.TestCase):
             time.sleep(0.02)
         return False
 
+    def test_data_and_flamp_controls(self):
+        w = self.w
+        self.assertIn("Data", [w.tabs.tabText(i) for i in range(w.tabs.count())])
+        self.assertIn("FLAMP", [w.tabs.tabText(i) for i in range(w.tabs.count())])
+        self.assertEqual(w.data_mode.currentText(), "MFSK32")
+        self.assertEqual(w.data_sweetspot.value(), 1500)
+        self.assertTrue(w.data_squelch.isChecked())
+        self.assertEqual(w.data_threshold.value(), 20)
+        w.data_mode.setCurrentText("Auto (RSID)")
+        self.assertFalse(w.data_sweetspot.isEnabled())
+        w.data_mode.setCurrentText("MFSK32")
+        w.data_source.setCurrentIndex(1)
+        self.assertTrue(w.data_choose_file.isEnabled())
+        w.data_source.setCurrentIndex(0)
+        w._on_event("data_state", {"session": 1, "active": True, "message": "Decoding MFSK32"})
+        w._on_event("data_text", {"session": 1, "text": "HELLO X\bICOM"})
+        self.assertEqual(w.data_text.toPlainText(), "HELLO ICOM")
+        w._on_event("data_quality", {"session": 1, "value": 80})
+        self.assertEqual(w.data_quality.value(), 80)
+        self.assertEqual(w.data_gate.text(), "Open")
+        w._on_event("data_text", {"session": 0, "text": "stale"})
+        self.assertEqual(w.data_text.toPlainText(), "HELLO ICOM")
+        w._append_data_text("x" * 210000)
+        self.assertLessEqual(w.data_text.document().characterCount(), 200000)
+        w._on_event("data_state", {"session": 1, "active": False, "message": "Stopped"})
+        from icomremote.flamp import Transfer
+        transfer = Transfer("ABCD", filename="received.txt", size=(32, 2, 16),
+                            blocks={1: b"x" * 16}, received_bytes=16)
+        w._on_event("flamp_transfers", [transfer.info()])
+        self.assertEqual(w.flamp_table.item(0, 1).text(), "1 / 2")
+        self.assertEqual(w.flamp_table.item(0, 2).text(), "2")
+        self.assertFalse(w.flamp_save.isEnabled())
+        transfer.blocks[2] = b"y" * 16
+        transfer.payload = b"x" * 16 + b"y" * 16
+        w._on_event("flamp_transfers", [transfer.info()])
+        self.assertTrue(w.flamp_save.isEnabled())
+
+    def test_mod_checkboxes_switch_sources_without_reconnecting(self):
+        w = self.w
+        p = self.radio.ports
+        w.service.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer",
+                                         p["control"], p["serial"], p["audio"]))
+        self.assertTrue(self.pump_until(lambda: w.manage_data_mod.isEnabled()
+                                       and w.radio._mods_ready is True))
+        serial = w.radio._serial
+        for checkbox, item, original in ((w.manage_data_mod, b"\x00\x85", 1),
+                                         (w.manage_data_off_mod, b"\x00\x84", 0)):
+            checkbox.click()
+            self.assertTrue(self.pump_until(lambda: self.radio.menu[item] == original
+                                           and not w.radio.mod_change_active and checkbox.isEnabled()))
+            self.assertFalse(checkbox.isChecked())
+            checkbox.click()
+            self.assertTrue(self.pump_until(lambda: self.radio.menu[item] == 5
+                                           and not w.radio.mod_change_active and checkbox.isEnabled()))
+            self.assertTrue(checkbox.isChecked())
+        self.assertIs(w.radio._serial, serial)
+        self.assertTrue(w.radio.connected)
+
     def test_operating_controls_stay_on_main_tab(self):
         radio_page = self.w.tabs.widget(0)
         audio_page = self.w.tabs.widget(1)
@@ -177,6 +235,46 @@ class TestGui(unittest.TestCase):
             w.log_export_btn.click()
         self.assertEqual(output.read_bytes(), original + b"new entry\n")
 
+    def test_powered_tune_supports_voice_and_data_modes(self):
+        from unittest.mock import patch
+        from icomremote.session import ConnectionSpec
+        w = self.w
+        p = self.radio.ports
+        w.service.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer",
+                                         p["control"], p["serial"], p["audio"]))
+        self.assertTrue(self.pump_until(lambda: w.powered_tune_btn.isEnabled() and w.radio._mods_ready is True))
+        original_power = self.radio.rf_power
+        with patch("icomremote.session.LOW_TUNE_SECONDS", 0.15):
+            for mode in ("USB", "LSB", "AM", "FM"):
+                for data in (False, True):
+                    w.service.set_mode(mode, data)
+                    self.assertTrue(self.pump_until(lambda: w.radio.rig.mode == mode and w.radio.rig.data == data))
+                    w.powered_tune_btn.click()
+                    self.assertTrue(self.pump_until(lambda: w.radio.low_tuning))
+                    self.assertTrue(self.pump_until(lambda: not w.radio.low_tuning))
+                    self.assertEqual(self.radio.rf_power, original_power)
+                    self.assertFalse(self.radio.ptt)
+        self.assertEqual(len(self.radio.tune_started), 8)
+        self.assertEqual(self.radio.rf_power_writes, [])
+
+    def test_custom_filter_selects_fil1_and_keeps_audio_notch_independent(self):
+        from icomremote.session import ConnectionSpec
+        w = self.w
+        p = self.radio.ports
+        w.service.connect(ConnectionSpec("127.0.0.1", "beer", "beerbeer",
+                                         p["control"], p["serial"], p["audio"]))
+        self.assertTrue(self.pump_until(lambda: w.custom_filter_btn.isEnabled()))
+        w.custom_filter_btn.click()
+        self.assertTrue(self.pump_until(lambda: w.radio.receive_dsp.custom and self.radio.filt == 1))
+        self.assertTrue(w.custom_filter_btn.isChecked())
+        w.audio_notch_enabled.setChecked(True)
+        w._apply_receive_filters()
+        self.assertTrue(w.radio.receive_dsp.notch)
+        w.filter_buttons[2].click()
+        self.assertTrue(self.pump_until(lambda: self.radio.filt == 2))
+        self.assertFalse(w.radio.receive_dsp.custom)
+        self.assertTrue(w.radio.receive_dsp.notch)
+
     def test_low_power_tune_times_out_and_restores_power(self):
         import numpy as np
         from icomremote.session import ConnectionSpec
@@ -193,7 +291,7 @@ class TestGui(unittest.TestCase):
         self.assertEqual(self.radio.rf_power, 13)
         self.assertTrue(self.pump_until(lambda: not w.radio.low_tuning, timeout=12))
         duration = self.radio.ptt_log[1][0] - self.radio.ptt_log[0][0]
-        self.assertAlmostEqual(duration, 10, delta=0.3)
+        self.assertAlmostEqual(duration, 5, delta=0.3)
         samples = np.frombuffer(bytes(self.radio.tx_audio), dtype="<i2")
         spectrum = abs(np.fft.rfft(samples)) ** 2
         frequencies = np.fft.rfftfreq(len(samples), 1 / 48000)
@@ -202,7 +300,7 @@ class TestGui(unittest.TestCase):
         self.assertFalse(self.radio.ptt)
         self.assertEqual(self.radio.rf_power_writes[-2:], [13, original])
         self.assertEqual(self.radio.rf_power, original)
-        self.assertEqual(self.radio.tune_started, [])
+        self.assertEqual(len(self.radio.tune_started), 1)
 
         w.low_tune_btn.click()
         self.assertTrue(self.pump_until(lambda: self.radio.ptt))
@@ -280,10 +378,12 @@ class TestGui(unittest.TestCase):
         self.assertTrue(self.pump_until(lambda: w.rf_power_label.text() == "50 %"))  # 128/255 from the radio
         w.rf_power.setValue(25)
         self.assertTrue(self.pump_until(lambda: self.radio.rf_power == 64))
+        self.assertTrue(self.pump_until(lambda: w.tuner_label.text() == "Tuner: on"))
         w.tune_btn.click()
-        self.assertTrue(self.pump_until(lambda: self.radio.tuner == 2 and "tuning" in w.tuner_label.text()))
-        self.assertFalse(w.tune_btn.isEnabled())
-        self.assertTrue(self.pump_until(lambda: w.tuner_label.text() == "Tuner: on" and w.tune_btn.isEnabled()))
+        self.assertTrue(self.pump_until(lambda: self.radio.tuner == 0 and not w.tune_btn.isChecked()))
+        w.tune_btn.click()
+        self.assertTrue(self.pump_until(lambda: self.radio.tuner == 1 and w.tune_btn.isChecked()))
+        self.assertEqual(self.radio.tune_started, [])
 
         w._connect_clicked()                                # Disconnect
         self.assertTrue(self.pump_until(lambda: not w.freq.isEnabled()

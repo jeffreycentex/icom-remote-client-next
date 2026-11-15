@@ -19,11 +19,27 @@ for optional in ("samplerate", "av"):          # bundled when installed in the b
         print("NOTE: optional package %r not installed; the build will not include it" % optional)
 
 console = os.environ.get("ICOMREMOTE_CONSOLE") == "1"
+decoder_name = "icom-data-decoder.exe" if sys.platform == "win32" else "icom-data-decoder"
+decoder = os.path.join(SPECPATH, "build", "decoder", decoder_name)
+if not os.path.isfile(decoder):
+    raise SystemExit("Run 'python build_decoder.py' before packaging")
+licenses = os.path.join(SPECPATH, "third_party", "fldigi-core")
+license_data = [
+    (os.path.join(licenses, name), "licenses/fldigi-core")
+    for name in ("COPYING", "COPYING.LESSER", "THIRD_PARTY_NOTICES.md", "README.md",
+                 "PROVENANCE.json", "SOURCES.json")]
+license_data.extend([
+    (os.path.join(licenses, "vendor", "fldigi", "AUTHORS"), "licenses/fldigi-core"),
+    (os.path.join(licenses, "vendor", "fldigi", "SOURCE.json"), "licenses/fldigi-core"),
+    (os.path.join(licenses, "web", "licenses", "*"), "licenses/tiniconv"),
+    (os.path.join(SPECPATH, "native", "PORT_PROVENANCE.json"), "licenses/fldigi-core")])
+
 
 a = Analysis(["run_icomremote.py"], pathex=["."], hiddenimports=hidden,
              excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
                        "PySide6.Qt3DCore", "PySide6.QtQuick", "PySide6.QtQml"],
-             datas=[("icomremote/assets/radio.svg", "icomremote/assets")],
+             binaries=[(decoder, "decoder")],
+             datas=[("icomremote/assets/radio.svg", "icomremote/assets")] + license_data,
              noarchive=False)
 pyz = PYZ(a.pure)
 if sys.platform == "darwin":

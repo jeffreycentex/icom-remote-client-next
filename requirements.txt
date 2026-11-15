@@ -2,6 +2,7 @@
 PySide6>=6.6
 keyring>=25.0             # native OS credential storage; no plaintext fallback
 numpy>=1.24
+scipy>=1.12
 sounddevice>=0.4.6        # PortAudio wheels included on Windows/macOS; Linux needs libportaudio2
 
 # Recommended

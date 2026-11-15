@@ -27,10 +27,11 @@ import numpy as np
 
 from . import civ, netcompat
 from .restore import RestoreStore
+from .receive_dsp import ReceiveDSP
 from .state import freq_limits
 from .rsba1.stream import StreamError
 from .rsba1.streams import AudioStream, AuthError, ControlStream, SerialStream
-from .sinks import BufferedFileSink, SoundCardSink, make_file_sink
+from .sinks import BufferedFileSink, SoundCardSink, audio_devices_conflict, make_file_sink
 from .timerres import high_resolution_timer
 
 log = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ MODS_SETUP_WAIT = 8.0               # key-down waits this long for DATA MOD setu
 TX_INPUT_WATCHDOG = 1.0             # keyed and no audio from the input for this long: reopen it
 SINK_STALL_SECONDS = 2.0            # audio arriving but the sound card has stopped asking for it
 HEALTH_LOG_INTERVAL = 60.0
-LOW_TUNE_SECONDS = 10
+LOW_TUNE_SECONDS = 5
 LOW_TUNE_POWER = 13                  # closest CI-V step to 5%
 LOW_TUNE_TONE_HZ = 1000
 MAX_GAP_FILL = 1800.0               # seconds of silence inserted into a recording for one gap
@@ -195,10 +196,13 @@ class RadioSession:
         self._keyed = False              # loop-thread view of self.ptt
         self._tx_frames_sent = 0         # audio frames sent since key-down
         self._tx_key_count = 0
-        self._sink_watch = None          # (callbacks, rx packets, time, sink) at the last check
+        self._sink_watch = {}            # output name -> (callbacks, rx packets, time, sink)
+        self._mod_change = None          # connected modulation-source change
         self._mod_retry = None           # task re-reading DATA MOD after a failed read
         self._wake_setup = None          # task switching DATA MOD to LAN after the radio woke up
         self._health_at = 0.0
+        self._data_decoder = None   # service owns worker lifetime; radio only enqueues raw PCM
+        self.receive_dsp = ReceiveDSP()
         self.dsp = {}
         self._ptt_owner = None
         self._ptt_timer = None
@@ -278,6 +282,8 @@ class RadioSession:
         self._close_tx_sources()
         self.stop_recording()
         self._install_sink("card", None)
+        self._install_sink("monitor", None)
+        self.set_data_decoder(None)
 
     def _thread_main(self, ready):
         with high_resolution_timer():
@@ -339,6 +345,7 @@ class RadioSession:
             info = await self._until_failed(control.start(), failed)
             self.info = info
             self.freq_limits = freq_limits(info.radio_name)
+            self.receive_dsp.reset()
             addr = self._choose_civ_address(info)
             self._decoder = civ.CivDecoder(addr)
 
@@ -352,6 +359,11 @@ class RadioSession:
             await self._until_failed(audio.start(), failed)
 
             with self._sink_lock:
+                if self._data_decoder is not None:
+                    try:
+                        self._data_decoder.set_input_rate(SAMPLE_RATE)
+                    except RuntimeError:
+                        self._data_decoder = None
                 for name, sink in list(self._sinks.items()):
                     self._sink_set_rate(name, sink)
             self._emit("radio", {"name": info.radio_name, "civ_address": addr,
@@ -526,29 +538,33 @@ class RadioSession:
     def _check_sink(self):
         """Audio is arriving but the sound card's callback has stopped running
         (device stalled or reset underneath us): reopen the output."""
+        for output in ("card", "monitor"):
+            self._check_output(output)
+
+    def _check_output(self, output):
         a = self._audio
-        sink = self._sinks.get("card")
+        sink = self._sinks.get(output)
         cb = getattr(sink, "callbacks", None)
         if a is None or cb is None:
-            self._sink_watch = None
+            self._sink_watch.pop(output, None)
             return
         now = time.monotonic()
-        w = self._sink_watch
+        w = self._sink_watch.get(output)
         if w is None or w[0] != cb or w[1] == a.rx_audio_packets or w[3] is not sink:
-            self._sink_watch = (cb, a.rx_audio_packets, now, sink)
+            self._sink_watch[output] = (cb, a.rx_audio_packets, now, sink)
             return
         if now - w[2] < SINK_STALL_SECONDS:
             return
-        self._sink_watch = None
+        self._sink_watch.pop(output, None)
         name = sink.device_key.split("|")[0]
         log.warning("sound card '%s' stopped playing (%d callbacks, audio still arriving); reopening",
                     name, cb)
         try:
-            self._install_sink("card", SoundCardSink(sink.device_key, sink.gain))
+            self._install_sink(output, SoundCardSink(sink.device_key, sink.gain))
             self._status("Audio output '%s' had stalled and was reopened" % name, "error")
         except Exception as e:
             log.exception("reopening sound card failed")
-            self._drop_sink("card", "Audio output '%s' stalled and could not be reopened: %s" % (name, e))
+            self._drop_sink(output, "Audio output '%s' stalled and could not be reopened: %s" % (name, e))
 
     def _log_health(self):
         st = self.stats()
@@ -616,6 +632,9 @@ class RadioSession:
                     old_mode = self.rig.mode, self.rig.data
                     changed = st != self.rig
                     self.rig = st
+                if self.receive_dsp.custom and st.filter != 1:
+                    self.receive_dsp.disable_custom()
+                    self._emit("receive_filter", False)
                 if changed:
                     self._emit("rig", st)
                 if (st.mode, st.data) != old_mode:
@@ -853,7 +872,7 @@ class RadioSession:
     def dsp_ready(self):
         return (self.dsp_supported and self._connected and self.power == "on"
                 and not (self.ptt or self.tx or self._keyed or self._keying
-                         or self.low_tuning or self._tuning or self.tuner == civ.TUNER_TUNING))
+                         or self.low_tuning or self.mod_change_active or self._tuning or self.tuner == civ.TUNER_TUNING))
 
     def _read_dsp(self):
         fields = civ.dsp_fields(self.rig.mode)
@@ -942,8 +961,76 @@ class RadioSession:
             return "%s could not be read from the radio (not confirmed as LAN)" % MOD_SETTINGS[setting][0]
         return None
 
+    @property
+    def mod_change_active(self):
+        return self._mod_change is not None and not self._mod_change.done()
+
+    @session_command
+    def set_mod_management(self, changes):
+        if self.mod_change_active:
+            raise PttRefused("Wait for the modulation-source change to finish")
+        if not self._connected or self.power != "on":
+            for setting, enabled in changes.items():
+                self.mods[setting]["manage"] = bool(enabled)
+            return
+        if self.tuner == civ.TUNER_TUNING and not self._tuning and not self.low_tuning:
+            raise PttRefused("Wait for the antenna tuner to finish")
+        for setting in changes:
+            if self.mods[setting]["item"] is None:
+                raise ValueError("Modulation-source switching is unavailable for this radio")
+        self._mod_change = self._loop.create_task(self._change_mod_management(changes))
+        self._emit_mods()
+
+    async def _change_mod_management(self, changes):
+        try:
+            await self._finish_mod_setup(include_changes=False)
+            if self.low_tuning:
+                self.stop_low_tune()
+                await self._low_tune_task
+            self._stop_tune()
+            self._unkey(reason="Unkeyed: changing transmit audio source")
+            a = self.civ_address
+            rx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt")
+            if rx != ("ptt", 0):
+                raise PttRefused("Cannot change transmit audio source until the radio confirms receive")
+            for setting, enabled in changes.items():
+                m = self.mods[setting]
+                label = MOD_SETTINGS[setting][0]
+                current = await self._read_menu(m["item"])
+                if current is None:
+                    m["value"] = None
+                    raise RuntimeError("Could not read " + label)
+                m["value"] = current
+                original = self._store.get(m["key"], setting)
+                if enabled:
+                    if current != self._lan:
+                        # A pending original survives uncertain writes and retries.
+                        original = original if original is not None else current
+                        self._store.put(m["key"], setting, original)
+                        m["original"] = original
+                    target = self._lan
+                else:
+                    target = original if original is not None else current
+                if target != current:
+                    m["value"] = None
+                    if not await self._write_menu(m["item"], target):
+                        raise RuntimeError("Could not confirm " + label + " change")
+                    m["value"] = target
+                if not enabled:
+                    self._store.clear(m["key"], setting)
+                    m["original"] = None
+                m["manage"] = bool(enabled)
+                self._status("%s is %s" % (label, self._mod_name(target)))
+        except (RuntimeError, OSError) as error:
+            self._status(str(error), "error")
+        finally:
+            self._mod_change = None
+            self._emit_mods()
+
     def ptt_refusal(self, voice_ok=False):
         """Why PTT can't be keyed now, or None if it can."""
+        if self.mod_change_active:
+            return "transmit audio source is changing"
         if not self._connected:
             return "not connected to the radio"
         if self.power != "on":
@@ -1090,7 +1177,7 @@ class RadioSession:
         (transmit is refused while they are unknown)."""
         try:
             for setting in self._unknown_mods():
-                if self._mods_ready is not True or self._keyed or self._keying or not self.info:
+                if self.mod_change_active or self._mods_ready is not True or self._keyed or self._keying or not self.info:
                     return
                 m = self.mods[setting]
                 label = MOD_SETTINGS[setting][0]
@@ -1212,8 +1299,8 @@ class RadioSession:
         self._require_on()
         if not civ.has_tuner(self._model):
             raise PttRefused("TUNE: the %s has no antenna tuner command" % self._model)
-        if self.ptt or self._keyed or self.low_tuning:
-            raise PttRefused("TUNE refused: transmitting")
+        if self.ptt or self._keyed or self.low_tuning or self.mod_change_active:
+            raise PttRefused("TUNE refused: transmitting or changing audio source")
         if self._tuning:
             return
         self._tuning = True
@@ -1228,18 +1315,18 @@ class RadioSession:
         return self._low_tune_task is not None
 
     @session_command
-    def start_low_tune(self):
+    def start_low_tune(self, powered=False):
         self._require_on()
         if not self.low_tune_supported:
             raise PttRefused("Low Power Tune is available on the IC-7300MK2")
         if self.low_tuning or self.ptt or self.tx or self._keying or self._keyed:
             raise PttRefused("Low Power Tune requires the radio to be receiving")
-        if self._tuning or self.tuner == civ.TUNER_TUNING or self._mods_ready is not True:
+        if self.mod_change_active or self._tuning or self.tuner == civ.TUNER_TUNING or self._mods_ready is not True:
             raise PttRefused("Wait for radio setup or antenna tuning to finish")
-        if not self.rig.data or self.rig.mode not in ("USB", "LSB"):
-            raise PttRefused("Select USB-D or LSB-D for Low Power Tune")
+        if self.rig.mode not in ("USB", "LSB", "AM", "FM"):
+            raise PttRefused("Select USB, LSB, AM or FM for tone tuning")
         self._low_tune_stop = False
-        self._low_tune_task = self._loop.create_task(self._run_low_tune())
+        self._low_tune_task = self._loop.create_task(self._run_low_tune(powered))
         self._emit("low_tune", True)
 
     @session_command
@@ -1249,31 +1336,34 @@ class RadioSession:
             if self._low_tune_keyed:
                 self._tx_civ(civ.set_ptt(self.civ_address, False))
 
-    async def _run_low_tune(self):
+    async def _run_low_tune(self, powered):
         a = self.civ_address
         original = None
         power_changed = False
-        status, severity = "Low Power Tune stopped", "info"
+        label = "Powered Tune" if powered else "Low Power Tune"
+        status, severity = label + " stopped", "info"
         try:
-            mode = self.rig.mode
-            item = self.mods["data_mod"]["item"]
+            mode, data_mode = self.rig.mode, self.rig.data
+            setting = "data_mod" if data_mode else "data_off_mod"
+            item = self.mods[setting]["item"]
             if item is None or await self._read_menu(item) != self._lan:
-                raise PttRefused("Low Power Tune requires DATA MOD set to LAN")
+                raise PttRefused("Tone tuning requires %s set to LAN" % MOD_SETTINGS[setting][0])
             power = await self._civ_ask(civ.read_rf_power(a), lambda k, v: k == "rfpower")
             if power is None:
                 raise PttRefused("Could not read the current RF power")
             original = power[1]
             if self._low_tune_stop:
                 return
-            power_changed = True
-            self._tx_civ(civ.set_rf_power(a, LOW_TUNE_POWER))
-            result = await self._civ_ask(civ.read_rf_power(a), lambda k, v: k == "rfpower")
-            if result is None or not 11 <= result[1] <= LOW_TUNE_POWER:
-                raise PttRefused("Radio did not confirm the 5% RF power setting")
+            if not powered:
+                power_changed = True
+                self._tx_civ(civ.set_rf_power(a, LOW_TUNE_POWER))
+                result = await self._civ_ask(civ.read_rf_power(a), lambda k, v: k == "rfpower")
+                if result is None or not 11 <= result[1] <= LOW_TUNE_POWER:
+                    raise PttRefused("Radio did not confirm the 5% RF power setting")
             mode_reply = await self._civ_ask(civ.read_mode(a), lambda k, v: k == "reply" and v == "mode")
             confirmed = await self._civ_ask(civ.read_data_mode(a), lambda k, v: k == "reply" and v == "data")
-            if mode_reply is None or confirmed is None or not self.rig.data or self.rig.mode != mode:
-                raise PttRefused("Radio did not confirm SSB DATA mode")
+            if mode_reply is None or confirmed is None or self.rig.data != data_mode or self.rig.mode != mode:
+                raise PttRefused("Radio did not confirm the selected mode")
             rx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt")
             if rx != ("ptt", 0) or self.tuner == civ.TUNER_TUNING:
                 raise PttRefused("Radio did not confirm receive")
@@ -1283,30 +1373,33 @@ class RadioSession:
                 raise PttRefused("Low Power Tune requires the radio audio stream")
 
             self._low_tune_keyed = True
-            deadline = self._loop.time() + LOW_TUNE_SECONDS
             self._tx_civ(civ.set_ptt(a, True))
             tx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt", attempts=1)
             if self._low_tune_stop:
                 return
             if tx != ("ptt", 1):
                 raise PttRefused("Radio did not confirm transmit")
-            self._status("Low Power Tune: 5% for up to 10 seconds")
+            self._status("Powered Tune" if powered else "Low Power Tune: 5%")
+            # Put tone audio on the LAN stream before requesting the ATU cycle.
+            first = (4096 * np.sin(2 * np.pi * LOW_TUNE_TONE_HZ * np.arange(960) / 48000))
+            self._audio.send_frame(first.astype("<i2").tobytes())
+            await asyncio.sleep(0.02)
+            if self._low_tune_stop:
+                return
+            self._tx_civ(civ.set_tuner(a, civ.TUNER_TUNING))
+            self._tx_civ(civ.read_tuner(a))
+            deadline = self._loop.time() + LOW_TUNE_SECONDS
             # 20 ms at 48 kHz is exactly 20 periods. Repeating this buffer
-            # preserves phase. Fade the first and final 100 ms.
+            # preserves phase across packet boundaries.
             samples = np.arange(960)
             tone = 4096 * np.sin(2 * np.pi * LOW_TUNE_TONE_HZ * samples / 48000)
-            elapsed = 0.0
             while (not self._low_tune_stop and self._loop.time() < deadline
-                   and self.tx and self.rig.data and self.rig.mode == mode
+                   and self.rig.data == data_mode and self.rig.mode == mode
                    and self._audio is not None and not self._audio.closed):
-                remaining = deadline - self._loop.time()
-                gain = np.clip(np.minimum(elapsed + samples / 48000,
-                                          remaining - samples / 48000) / 0.1, 0, 1)
-                self._audio.send_frame((tone * gain).astype("<i2").tobytes())
+                self._audio.send_frame(tone.astype("<i2").tobytes())
                 await asyncio.sleep(min(0.02, max(0, deadline - self._loop.time())))
-                elapsed += 0.02
             if not self._low_tune_stop and self._loop.time() >= deadline:
-                status = "Low Power Tune complete"
+                status = label + " complete"
         except PttRefused as exc:
             status, severity = str(exc), "error"
         except (StreamError, OSError):
@@ -1316,12 +1409,18 @@ class RadioSession:
             try:
                 received = not self._low_tune_keyed and not self.tx
                 if self._low_tune_keyed:
+                    # End the automatic tune cycle as well as software PTT.
+                    self._tx_civ(civ.set_tuner(a, civ.TUNER_ON))
                     for _ in range(2):
                         self._tx_civ(civ.set_ptt(a, False))
                         rx = await self._civ_ask(civ.read_ptt(a), lambda k, v: k == "ptt", attempts=1)
                         if rx == ("ptt", 0):
                             received = True
                             break
+                if self._low_tune_keyed:
+                    tuner = await self._civ_ask(civ.read_tuner(a), lambda k, v: k == "tuner")
+                    if tuner is None or tuner[1] == civ.TUNER_TUNING:
+                        status, severity = "Could not confirm the antenna tuner stopped", "error"
                 if not received and power_changed:
                     status, severity = "Could not confirm RX. RF power was not restored.", "error"
                 elif power_changed:
@@ -1334,6 +1433,23 @@ class RadioSession:
                 self._low_tune_task = None
                 self._emit("low_tune", False)
                 self._status(status, severity)
+
+    @session_command
+    def set_tuner_enabled(self, enabled):
+        self._require_on()
+        if not civ.has_tuner(self._model) or self.low_tuning or self.mod_change_active or self.ptt or self.tx or self._keyed:
+            raise PttRefused("Tuner switching requires receive and a supported tuner")
+        self._tx_civ(civ.set_tuner(self.civ_address, civ.TUNER_ON if enabled else civ.TUNER_OFF))
+        self._tx_civ(civ.read_tuner(self.civ_address))
+
+    @session_command
+    def configure_receive_dsp(self, **settings):
+        # Validate before sending FIL1 or changing the active audio pipeline.
+        candidate = ReceiveDSP()
+        candidate.configure(**settings)
+        if candidate.custom and not self.receive_dsp.custom:
+            self.control_tune(filt=1)
+        self.receive_dsp = candidate
 
     def _start_tune(self):
         if self._tune_timer is not None:
@@ -1379,6 +1495,11 @@ class RadioSession:
     # ------------------------------------------------------------------ TX audio
     def set_tx_device(self, device_key, gain=1.0, kind="data"):
         """Select the data or voice transmit input (None = none). Opens it now if connected."""
+        with self._sink_lock:
+            if device_key and any(name in ("card", "monitor") and
+                                  audio_devices_conflict(sink.device_key, device_key)
+                                  for name, sink in self._sinks.items()):
+                raise ValueError("Receive and transmit audio must use different devices")
         self._tx_devices[kind] = (device_key, gain) if device_key else None
         loop = self._loop
         if self._connected and loop is not None and not loop.is_closed():
@@ -1525,7 +1646,7 @@ class RadioSession:
                              % (label, self._mod_name(original)))
             else:
                 self._status("Could not switch %s to LAN" % label, "error")
-        elif original != self._lan:
+        elif pending is not None and original != self._lan:
             m["original"] = original                         # pending from an earlier session
         elif pending is not None:
             self._store.clear(key, setting)                  # original was LAN: nothing to do
@@ -1534,7 +1655,7 @@ class RadioSession:
         out = {}
         for setting, (label, _) in MOD_SETTINGS.items():
             m = self.mods[setting]
-            out[setting] = {"label": label, "value": m["value"], "original": m["original"],
+            out[setting] = {"manage": m["manage"], "changing": self.mod_change_active, "item_known": m["item"] is not None, "label": label, "value": m["value"], "original": m["original"],
                             "original_name": self._mod_name(m["original"]) if m["original"] is not None else None,
                             "name": self._mod_name(m["value"]) if m["value"] is not None else None}
         self._emit("data_mod", out)
@@ -1558,14 +1679,15 @@ class RadioSession:
         self._emit_mods()
         return ok
 
-    async def _finish_mod_setup(self):
+    async def _finish_mod_setup(self, include_changes=True):
         """Before restoring: let a DATA MOD switch still running in the
         background (after a wake-up, or a re-read) finish, so the restore sees
         what it changed. Otherwise it could write LAN after the restore had
         found nothing to put back. Cancelling is safe at any point: the
         original is recorded (memory and disk) before the radio is touched."""
         current = asyncio.current_task()
-        for t in (self._wake_setup, self._mod_retry):
+        tasks = (self._wake_setup, self._mod_retry) + ((self._mod_change,) if include_changes else ())
+        for t in tasks:
             if t is None or t.done() or t is current:
                 continue
             try:
@@ -1606,7 +1728,16 @@ class RadioSession:
 
     # ------------------------------------------------------------------ audio
     def _on_audio(self, pcm):
-        samples = np.frombuffer(pcm, dtype="<i2")
+        raw_samples = np.frombuffer(pcm, dtype="<i2")
+        with self._sink_lock:
+            if self._data_decoder is not None and self._connected:
+                try:
+                    self._data_decoder.write(raw_samples)
+                except RuntimeError as error:
+                    # Overload is reported by the decoder; its worker owns cleanup.
+                    self._data_decoder = None
+                    self._status(str(error), "error")
+        samples = self.receive_dsp.process(raw_samples)
         with self._sink_lock:
             if "file" in self._sinks:
                 self._fill_recording_gap()
@@ -1666,10 +1797,28 @@ class RadioSession:
                     self._sink_set_rate(name, sink)
         return name in self._sinks if sink is not None else True
 
-    def set_audio_device(self, device_key, gain=1.0):
-        """device_key None -> stop sound-card output."""
+    def set_data_decoder(self, sink):
+        # Service worker calls this. No process waits on the radio socket thread.
+        with self._sink_lock:
+            if sink is not None and self._connected:
+                sink.set_input_rate(SAMPLE_RATE)
+            self._data_decoder = sink
+        return True
+
+    def set_audio_device(self, device_key, gain=1.0, output="card"):
+        """Select either independently buffered receive output."""
+        if output not in ("card", "monitor"):
+            raise ValueError("Unknown receive audio output")
+        if device_key:
+            with self._sink_lock:
+                if any(name in ("card", "monitor") and name != output
+                       and sink.device_key == device_key for name, sink in self._sinks.items()):
+                    raise ValueError("Choose a different device for the second receive output")
+            if any(device and audio_devices_conflict(device_key, device[0])
+                   for device in self._tx_devices.values()):
+                raise ValueError("Receive and transmit audio must use different devices")
         sink = SoundCardSink(device_key, gain) if device_key else None
-        return self._install_sink("card", sink)
+        return self._install_sink(output, sink)
 
     def start_recording(self, path):
         """Record received audio (.wav, .m4a or .mp4). Waits for audio if not connected."""

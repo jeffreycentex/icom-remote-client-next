@@ -144,6 +144,66 @@ class TestDataMod(_TxBase):
         self.assertTrue(wait_for(lambda: any("DATA MOD restored to USB" in t for t in self.statuses())))
         self.assertTrue(wait_for(lambda: any("DATA OFF MOD restored to MIC" in t for t in self.statuses())))
 
+    def test_connected_toggle_restores_and_resaves_source(self):
+        self.assertTrue(wait_for(lambda: self.session._mods_ready is True))
+        session = self.session
+        before = session._audio.rx_audio_packets
+        session.set_mod_management({"data_mod": False})
+        self.assertTrue(wait_for(lambda: not session.mod_change_active))
+        self.assertEqual(self.radio.menu[b"\x00\x85"], USB)
+        self.assertFalse(session.manage_data_mod)
+        self.assertIsNone(session.mods["data_mod"]["original"])
+        self.assertTrue(wait_for(lambda: session._audio.rx_audio_packets > before))
+        self.assertTrue(session.connected)
+        # A locally changed source becomes the next original.
+        self.radio.menu[b"\x00\x85"] = MIC
+        session.set_mod_management({"data_mod": True})
+        self.assertTrue(wait_for(lambda: not session.mod_change_active))
+        self.assertEqual(self.radio.menu[b"\x00\x85"], LAN)
+        self.assertEqual(session.mods["data_mod"]["original"], MIC)
+        session.disconnect()
+        self.assertEqual(self.radio.menu[b"\x00\x85"], MIC)
+        self.assertEqual(self.pending(), {})
+
+    def test_connected_source_change_unkeys_before_writing(self):
+        self.assertTrue(wait_for(lambda: self.session._mods_ready is True))
+        session = self.session
+        session.set_tx_device("fake", kind="voice")
+        session.set_ptt(True, voice_ok=True)
+        self.assertTrue(wait_for(lambda: self.radio.ptt))
+        self.radio.menu_delay = 0.15
+        session.set_mod_management({"data_off_mod": False})
+        with self.assertRaises(PttRefused):
+            session.set_ptt(True, voice_ok=True)
+        self.assertTrue(wait_for(lambda: not session.mod_change_active))
+        self.assertFalse(self.radio.ptt)
+        self.assertFalse(session.ptt)
+        self.assertEqual(self.radio.menu[b"\x00\x84"], MIC)
+        self.assertTrue(session.connected)
+
+    def test_failed_connected_write_keeps_original_record(self):
+        from unittest.mock import patch
+        self.assertTrue(wait_for(lambda: self.session._mods_ready is True))
+        with patch.object(self.session, "_write_menu", return_value=False):
+            self.session.set_mod_management({"data_mod": False})
+            self.assertTrue(wait_for(lambda: not self.session.mod_change_active))
+        self.assertIsNone(self.session.mods["data_mod"]["value"])
+        self.assertEqual(self.session.mods["data_mod"]["original"], USB)
+        self.assertEqual(self.pending()["IC-7300MK2@127.0.0.1"]["data_mod"], USB)
+        self.session.set_mod_management({"data_mod": False})
+        self.assertTrue(wait_for(lambda: not self.session.mod_change_active))
+        self.assertFalse(self.session.manage_data_mod)
+        self.assertEqual(self.radio.menu[b"\x00\x85"], USB)
+
+    def test_disconnect_waits_for_connected_mod_change(self):
+        self.assertTrue(wait_for(lambda: self.session._mods_ready is True))
+        self.radio.menu_delay = 0.15
+        self.session.set_mod_management({"data_mod": False, "data_off_mod": False})
+        self.session.disconnect()
+        self.assertEqual(self.radio.menu[b"\x00\x85"], USB)
+        self.assertEqual(self.radio.menu[b"\x00\x84"], MIC)
+        self.assertEqual(self.pending(), {})
+
     def test_crash_then_recover(self):
         self.assertTrue(wait_for(lambda: self.session.data_mod == LAN))
 

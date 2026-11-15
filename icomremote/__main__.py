@@ -97,6 +97,17 @@ def check(verify_credentials=False):
     item("Recording", pyav, required=False)
     item("Resampler", resampler, required=False)
     item("Protocol", protocol)
+    def digital_decoder():
+        import subprocess
+        from .digital import decoder_path
+        path = decoder_path()
+        result = subprocess.run([str(path), "MFSK16", "1500"], input=b"",
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        if result.returncode or not result.stdout.startswith(b"READY\n"):
+            raise RuntimeError("Bundled digital decoder failed to initialize")
+        return "bundled MFSK/Contestia engine starts"
+    item("Digital", digital_decoder)
     from .secrets import SecretStore
     def credentials():
         store = SecretStore()

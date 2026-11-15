@@ -51,6 +51,13 @@ except Exception:
 # Output-device enumeration
 # --------------------------------------------------------------------------
 
+def audio_devices_conflict(receive, transmit):
+    rx = (receive or "").split("|")[0].lower()
+    tx = (transmit or "").split("|")[0].lower()
+    return bool(rx and tx and (rx == tx or
+                (rx.startswith("pulse-sink:") and tx == "pulse-source:%s.monitor" % rx[11:])))
+
+
 def sounddevice_error():
     return _SD_ERROR
 

@@ -411,19 +411,41 @@ shows **STANDBY** and disables tuning and transmit controls.
 
 - **Power** sets the radio's RF POWER (0-100 %) when you release the slider;
   changes made on the radio show up within a couple of seconds.
-- **TUNE** runs the internal antenna tuner's tune cycle, like the radio's
-  TUNER button. It transmits a carrier, so it is refused while PTT is on, and
-  PTT is refused while it runs. The cycle is stopped after 30 s or if you
-  disconnect; the result ("tuner on" or "tuner off") appears in the status.
+- **TUNE** toggles the internal antenna tuner on or off.
+- **Low Power Tune** temporarily sets RF POWER to 5%. **Powered Tune** uses
+  the selected RF POWER. Both send a steady 1 kHz tone, request an antenna
+  tuning cycle, continue the tone for five seconds, then return to receive.
+  Low Power Tune restores the previous power after receive is confirmed.
+  Click either tone button again to stop early. USB, LSB, AM and FM are
+  supported with DATA on or off, with the active modulation source set to LAN.
+  These tone controls are currently enabled for the IC-7300MK2.
+
+### Custom receive audio filters
+
+On the Radio tab, **Custom** selects FIL1 on the radio and enables a computer
+bandpass filter. Set its audio center frequency and full width in Hz on the
+DSP tab, then click **Apply audio filters**. Its usable passband is limited by
+the audio delivered through the radio's FIL1. Selecting FIL1, FIL2 or FIL3
+disables the computer bandpass.
+
+The DSP tab also provides a separate **Manual audio notch**, with an enable
+checkbox and center and width in Hz. It can operate independently of Custom
+and the radio's manual notch. These SciPy filters apply to playback, virtual
+audio output and recordings. Settings take effect when applied.
 
 ### DATA MOD and DATA OFF MOD
 
 The radio takes transmit audio from **DATA MOD** in DATA modes and from
 **DATA OFF MOD** in voice modes. Each has its own checkbox (both on by
 default). For each one switched on, the app reads the radio's setting when it
-connects, writes the original value to disk, then sets it to LAN. When you
-disconnect or quit, it puts the original back and confirms it by reading it
-back. While DATA OFF MOD is LAN, a microphone plugged into the radio is not
+connects, writes the original value to disk, then sets it to LAN.
+The checkboxes also work while connected. Unchecking restores the saved original
+source immediately, and checking selects LAN again. A new local source selected
+while unchecked becomes the next saved original. Receive audio continues over
+the same connection. The client releases its PTT before switching and confirms
+receive and the new source. Failed changes keep the restoration record for retry.
+When you disconnect or quit, it restores any source still managed by the app
+and confirms it by reading it back. While DATA OFF MOD is LAN, a microphone plugged into the radio is not
 used.
 
 If the app can't put it back (the app is killed, the computer loses power,
@@ -593,6 +615,95 @@ IC-7300MK2. Covered:
 - power: off/on from the app, off/on at the radio, connecting to a radio in standby,
   power-on ignored, 'Shutdown only' (network goes down), unkey and DATA MOD restore before off
 - the GUI, run offscreen against the fake radio (needs PySide6; skipped otherwise)
+
+### Two receive audio outputs
+
+On **Audio**, select a device with **Play to** and a second device with
+**Also play to**. Both selectors list the available outputs on macOS, Windows
+and Linux. For example, on a Mac choose BlackHole 2ch and MacBook Pro Speakers.
+Both devices receive the same
+radio audio, with independent gains and buffering. Device selections and
+enabled states are remembered on exit. Either output can be disabled independently.
+
+Use the existing **Audio from** transmit-input selector to switch between the
+Mac microphone for voice and BlackHole 16ch for MS-DMT. Receive and transmit
+virtual cables must be different. The radio's DATA-mode selection is independent.
+
+## Digital reception and FLAMP
+
+Open **Data** to receive **MFSK16**, **MFSK32**, **MFSK64**, or
+**Contestia 4-250**. THOR is deferred. The native modem is a private helper
+bundled with the application. Launch Icom Remote normally.
+
+1. Select **Receiver audio**, connect to the radio, and tune using the Radio
+   tab, normally in USB or USB-D. Set an IF filter wide enough for the signal.
+2. Select the digital mode and **Sweetspot** in audio Hz (default 1500 Hz).
+   Sweetspot is the center of the digital signal inside received audio.
+   Changing it does not change the radio's RF frequency.
+3. Click **Start decoding**. The tab displays received text, decoder quality,
+   and **Open/Closed** decoder squelch. Squelch starts enabled at threshold 20.
+   Change its threshold while decoding without restarting the modem.
+4. Use **Stop decoding** to cancel, or **Clear text** to clear the display.
+   Text history is bounded and modem backspaces are preserved.
+
+**Auto (RSID)** listens for a supported mode announcement and selects both
+the modem and its audio center. It requires an RSID burst, including the
+extended announcement for MFSK64. If the transmission has already started
+without an announcement, select the mode and sweetspot manually.
+
+For a recording, select **Audio file**, choose the file, and start decoding.
+The decoder finishes automatically at the end of the file, and Stop can
+cancel it. PCM WAV files work without PyAV. PyAV adds M4A, MP4, FLAC, OGG,
+MP3 and other formats supported by its installed codecs.
+
+Receiver decoding receives PCM before computer playback gain, Custom bandpass,
+and the computer audio notch. Those controls can be used for listening
+without altering decoder input. The radio's own NR, NB, notch and IF filters
+are applied before audio reaches the app and can affect decoding.
+
+### FLAMP files
+
+Open **FLAMP** and choose a receive folder. Files decoded through Data appear
+with their filename, transfer ID, received/total blocks, missing blocks and
+save status. **Automatically save completed files** is enabled by default.
+Use **Save selected** to save a completed file manually or retry after fixing
+a save failure. Existing files are preserved using numbered collision names.
+
+Valid blocks are retained across repeated transmissions and Data decoder
+restarts. Later blocks can fill gaps in the original transfer. Compatible
+duplicates are ignored, and conflicting metadata or blocks are reported.
+**Clear selected transfer** discards that transfer so it can be received again.
+Partial transfers live in memory until the application closes.
+
+FLAMP receives original modem bytes separately from readable display text.
+Plain files, BASE64, BASE128, BASE256 and FLAMP LZMA are supported. Frame CRC,
+size and decompression bounds are checked before a file is accepted.
+
+### Building the decoder from source
+
+A C/C++17 compiler is required to build the bundled helper. On macOS install
+the Xcode command-line tools. On Linux install a C/C++ build toolchain. On
+Windows use MSYS2 UCRT64 with MinGW GCC and its static runtimes.
+
+Run these commands in the project virtual environment:
+
+```sh
+python build_decoder.py --test-library
+python -m unittest tests.test_digital tests.test_flamp
+python build.py --no-install --no-decoder-build
+```
+
+In an MSYS2 shell, use `python build_decoder.py --cc gcc --cxx g++ --test-library`.
+The extra test DLL/dylib/shared library generates automated test signals.
+The normal `python build.py` path builds the helper automatically.
+Use `--no-decoder-build` only when the helper was already built for that OS.
+
+The buildable upstream modem sources, GPL/LGPL license texts and provenance
+are retained in `third_party/fldigi-core/`, with application entry points in
+`native/`. The port comes from KiwiSDR Remote Client digitalmodes / v0.1,
+commit `a28a9ad49066d64892ca7d6200066f6c39b2d997`. Distribute the corresponding
+source with each release. See THIRD_PARTY_NOTICES.md and
+native/PORT_PROVENANCE.json for the source mapping.
 
 ## Standalone app
 

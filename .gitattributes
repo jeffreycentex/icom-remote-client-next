@@ -1,0 +1,2 @@
+# Preserve the pinned upstream bytes and their recorded provenance hashes.
+third_party/fldigi-core/** -text -whitespace

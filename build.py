@@ -92,6 +92,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-install", action="store_true", help="don't pip install anything")
     ap.add_argument("--console", action="store_true", help="Windows: build with a console window")
+    ap.add_argument("--no-decoder-build", action="store_true", help="use a decoder already built for this platform")
     ap.add_argument("--no-check", action="store_true", help="skip the self-check of the built app")
     args = ap.parse_args()
 
@@ -100,6 +101,8 @@ def main():
               "is installed globally.")
     if not args.no_install:
         run([sys.executable, "-m", "pip", "install", "--require-hashes", "-r", "requirements.lock"], check=True)
+    if not args.no_decoder_build:
+        run([sys.executable, "build_decoder.py"], check=True)
     env = dict(os.environ)
     if args.console:
         env["ICOMREMOTE_CONSOLE"] = "1"

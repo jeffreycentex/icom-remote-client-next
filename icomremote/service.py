@@ -53,7 +53,12 @@ class IcomService:
                  start_ticker=True):
         self._commands = CommandQueue()
         self._shutdown_done = False
-        self.radio = RadioSession(on_event=on_event, state_dir=state_dir)
+        self._on_event = on_event or (lambda kind, payload: None)
+        self._data_session = 0
+        self._data_decoder = None
+        from .flamp import FlampWorker
+        self._flamp = FlampWorker(self._emit)
+        self.radio = RadioSession(on_event=self._emit, state_dir=state_dir)
         self.record_dir = record_dir or default_record_dir()
         self.plain_ssb_is_data = True      # same rule as rigctl: plain USB/LSB -> USB-D/LSB-D
         self._clock = clock
@@ -65,6 +70,74 @@ class IcomService:
         if start_ticker:
             self._ticker = threading.Thread(target=self._tick_loop, name="icom-service", daemon=True)
             self._ticker.start()
+
+    def _emit(self, kind, payload=None):
+        try:
+            self._on_event(kind, payload)
+        except Exception:
+            log.exception("event handler failed for %s", kind)
+
+    def _on_data_event(self, kind, payload):
+        if payload["session"] != self._data_session:
+            return
+        if kind == "data_raw":
+            self._flamp.feed(payload["data"])
+            return
+        if kind == "data_state" and not payload["active"]:
+            try:
+                self._flamp.submit("flush")
+            except RuntimeError as error:
+                self._emit("flamp_status", str(error))
+        self._emit(kind, payload)
+
+    @command
+    def start_data(self, mode, sweetspot_hz=1500, *, squelch=True, threshold=20, source=None):
+        from .digital import DataDecoderSink, validate_data_mode
+        center = validate_data_mode(mode, sweetspot_hz)
+        if type(threshold) is not int or not 0 <= threshold <= 100:
+            raise ValueError("squelch threshold must be between 0 and 100")
+        if source is not None:
+            from .audiofile import local_audio_path
+            source = local_audio_path(source)
+        self.stop_data()
+        self._flamp.submit("reset")
+        self._data_session += 1
+        sink = DataDecoderSink(mode, center, self._on_data_event, self._data_session,
+                               squelch=squelch, threshold=threshold, source=source)
+        try:
+            if source is None and not self.radio.set_data_decoder(sink):
+                raise RuntimeError("Could not start digital decoder")
+        except Exception:
+            sink.close()
+            raise
+        self._data_decoder = sink
+
+    @command
+    def stop_data(self):
+        self.radio.set_data_decoder(None)
+        sink, self._data_decoder = self._data_decoder, None
+        if sink is not None:
+            sink.close()
+
+    @command
+    def set_data_squelch(self, enabled, threshold):
+        if self._data_decoder is not None:
+            self._data_decoder.set_squelch(enabled, threshold)
+
+    @command
+    def configure_flamp(self, directory, auto_save=True):
+        folder = os.path.abspath(os.path.expanduser(str(directory)))
+        if not str(directory).strip():
+            raise ValueError("Choose a FLAMP receive folder")
+        self._flamp.submit("configure", (folder, bool(auto_save)))
+
+    @command
+    def save_flamp(self, identifier):
+        self._flamp.submit("save", identifier)
+
+    @command
+    def clear_flamp(self, identifier=None):
+        self._flamp.submit("clear", identifier)
 
     @command
     def connect(self, spec):
@@ -102,8 +175,8 @@ class IcomService:
         return self.radio.set_rf_power(percent)
 
     @command
-    def set_audio_device(self, device_key, gain=1.0):
-        return self.radio.set_audio_device(device_key, gain)
+    def set_audio_device(self, device_key, gain=1.0, output="card"):
+        return self.radio.set_audio_device(device_key, gain, output=output)
 
     @command
     def set_tx_device(self, device_key, gain=1.0, kind="data"):
@@ -121,8 +194,16 @@ class IcomService:
     def power_off(self):
         return self.radio.power_off()
 
-    def start_low_tune(self):
-        return self.radio.start_low_tune()
+    def start_low_tune(self, powered=False):
+        return self.radio.start_low_tune(powered=powered)
+
+    @command
+    def set_tuner_enabled(self, enabled):
+        return self.radio.set_tuner_enabled(enabled)
+
+    @command
+    def configure_receive_dsp(self, **settings):
+        return self.radio.configure_receive_dsp(**settings)
 
     def stop_low_tune(self):
         return self.radio.stop_low_tune()
@@ -142,10 +223,11 @@ class IcomService:
             if not math.isfinite(value) or not 10 <= value <= 600:
                 raise ValueError("PTT timeout must be between 10 and 600 seconds")
             self.radio.ptt_timeout = value
-        for key, value in (("manage_data_mod", manage_data_mod),
-                           ("manage_data_off_mod", manage_data_off_mod)):
-            if value is not None:
-                setattr(self.radio, key, bool(value))
+        changes = {key: bool(value) for key, value in (
+            ("data_mod", manage_data_mod), ("data_off_mod", manage_data_off_mod))
+            if value is not None}
+        if changes:
+            self.radio.set_mod_management(changes)
 
     # ------------------------------------------------------------------ tuning
     @command
@@ -346,6 +428,12 @@ class IcomService:
     @command
     def _shutdown(self):
         try:
-            self.stop_recording(reason="shutdown")
+            self.stop_data()
         finally:
-            self.radio.shutdown()
+            try:
+                self._flamp.close()
+            finally:
+                try:
+                    self.stop_recording(reason="shutdown")
+                finally:
+                    self.radio.shutdown()

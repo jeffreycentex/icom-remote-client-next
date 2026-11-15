@@ -40,3 +40,25 @@ The passcode algorithm is credited by kappanhang to W6EL.
 `icomremote/sinks.py` and `icomremote/resample.py` come from
 [kiwisdr-remote](https://github.com/jeffreycentex/kiwisdr-remote)
 (GPL-3.0-or-later, same author as this project).
+
+## Digital reception and FLAMP
+
+The receive-only native modem, Python decoder bridge, audio-file reader, RSID
+detector, FLAMP assembler, and related tests were adapted from
+https://github.com/jeffreycentex/kiwisdr-remote-client at digitalmodes / v0.1,
+commit a28a9ad49066d64892ca7d6200066f6c39b2d997. Original file hashes and
+integration changes are recorded in native/PORT_PROVENANCE.json.
+
+The bundled modem sources are pinned to fldigi-web commit
+739174ecb182874ba595bafcd7ed5e8b4842a39e, based on fldigi 4.2.13.
+The complete copied source, authors, provenance manifests and GPL/LGPL
+license texts are under third_party/fldigi-core. Its PROVENANCE.json
+records upstream identities and hashes. These pinned files are preserved
+byte-for-byte. FLAMP receive framing and encoding are adapted from FLAMP
+by Dave Freese W1HKJ and Robert Stiles KK5VD, GPL-3.0-or-later.
+
+The packaging spec bundles the applicable license texts and provenance.
+Distribute the corresponding third_party/fldigi-core sources, native/
+entry points and build_decoder.py with the application source for each
+release. The wider upstream modem interfaces remain in the buildable
+source, while the application's helper exposes only the four receive modes.

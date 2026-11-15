@@ -45,6 +45,22 @@ jobs:
       - name: Install
         run: python -m pip install --require-hashes -r requirements.lock
 
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build digital decoder (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: python build_decoder.py --cc gcc --cxx g++ --test-library
+
+      - name: Build digital decoder (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: python build_decoder.py --test-library
+
       - name: Tests
         env:
           QT_QPA_PLATFORM: offscreen
@@ -54,7 +70,7 @@ jobs:
         if: success() || failure()          # build even when tests fail, to learn both
         env:
           CI: "1"
-        run: python build.py --no-install
+        run: python build.py --no-install --no-decoder-build
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: success() || failure()

@@ -339,3 +339,30 @@ Data needs two virtual cables (RX and TX) or received audio would be
 transmitted; the GUI refuses the same device both ways. macOS: BlackHole 2ch
 + 16ch. Windows: VB-CABLE + VB-CABLE A+B or Hi-Fi Cable. Linux: app-created
 null sinks IcomRX / IcomTX (use "Monitor of …"). Voice needs no cable.
+
+## Digital reception and FLAMP port
+
+- Port source is KiwiSDR Remote Client digitalmodes / v0.1, commit
+  a28a9ad49066d64892ca7d6200066f6c39b2d997. The pinned fldigi-core bytes and
+  provenance under third_party/fldigi-core must remain unchanged.
+- IcomService owns the decoder and FLAMP worker. Commands start/stop decoding
+  on the application command worker. Worker events are observational.
+- RadioSession only attaches/detaches a raw-PCM consumer and queues 48 kHz
+  PCM before local receive_dsp filtering and playback gain. Never join a
+  decoder process on the radio socket thread or while holding its sink lock.
+- The native helper, decoder I/O, RSID detection, resampling and file reading
+  run off the GUI/radio threads. FLAMP owns parsing, transfer state and disk
+  writes on its bounded worker. Feed raw modem octets before display text.
+- Decoder restarts reset only FLAMP framing, preserving valid blocks in memory.
+  Partial transfers are not persisted across application exits.
+- Build the helper with python build_decoder.py --test-library before tests.
+  build.py builds the helper by default. CI builds it with MinGW on Windows,
+  then uses --no-decoder-build for PyInstaller.
+- Run tests.test_digital, tests.test_flamp and tests.test_gui after port changes.
+  The helper is bundled on all OSes; --check must initialize the bundled helper.
+
+- DATA MOD and DATA OFF MOD checkboxes now apply immediately while connected.
+  IcomService submits one tracked session task, which releases PTT and confirms
+  RX before changing the source. Teardown waits for or cancels that task before
+  restoration. Keep pending originals on uncertain writes, and never restore an
+  unmanaged source that this session did not change.

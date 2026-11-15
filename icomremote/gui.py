@@ -7,14 +7,16 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QIODevice, QObject, QSaveFile, QSettings, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QIcon, QPalette
+from PySide6.QtCore import QEvent, QIODevice, QObject, QSaveFile, QSettings, QStandardPaths, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem,
     QSlider, QSpinBox, QStatusBar, QTabWidget, QVBoxLayout, QWidget)
 
 from . import __version__, civ, quicktune
+from .digital import DATA_MODES
 from .api import DEFAULT_PORT as API_DEFAULT_PORT, ApiServer
 from .rigctld import RigctldServer
 from .service import ApiError, IcomService, default_record_dir
@@ -104,6 +106,9 @@ class MainWindow(QMainWindow):
         self._rec_started = None
         self._space_owner = object()     # identifies space-bar keying to the session
         self._space_down = False
+        self._data_active = False
+        self._data_session = 0
+        self._flamp_transfers = []
         self._on_air = False             # radio transmitting or tuning: Po/SWR readout is live
         self._po = self._swr = None
 
@@ -140,7 +145,9 @@ class MainWindow(QMainWindow):
             ("Audio", (self._build_audio_box(), self.tx_audio_box)),
             ("Recording and control", (self._build_record_box(), self._build_rigctl_box(),
                                       self._build_api_box())),
-            ("DSP", (self._build_dsp_box(),)),
+            ("DSP", (self._build_dsp_box(), self._build_receive_filter_box())),
+            ("Data", (self._build_data_tab(),)),
+            ("FLAMP", (self._build_flamp_tab(),)),
             ("Log", (self._build_log_box(),)),
         ):
             page = QWidget()
@@ -148,7 +155,7 @@ class MainWindow(QMainWindow):
             layout.setSpacing(5)
             for box in boxes:
                 layout.addWidget(box)
-            if title != "Log":
+            if title not in ("Data", "FLAMP", "Log"):
                 layout.addStretch(1)
             self.tabs.addTab(page, title)
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -165,6 +172,10 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
         self._load_settings()
+        for name, control in self.receive_filter_inputs.items():
+            control.setValue(self.settings.value("audio_filter_" + name, control.value(), type=int))
+        self.audio_notch_enabled.setChecked(self.settings.value("audio_filter_notch", False, type=bool))
+        self._apply_receive_filters(custom=False)
         self._refresh_connection_state()
         self._check_quicktune()
         self._set_controls_enabled(False)
@@ -172,6 +183,7 @@ class MainWindow(QMainWindow):
         self._timer.start()
 
         if not HAVE_SOUNDDEVICE:
+            self.monitor_enable.setEnabled(False)
             self.audio_enable.setEnabled(False)
             self.audio_enable.setToolTip("PortAudio not available: %s" % sounddevice_error())
         if self.rig_enable.isChecked():
@@ -181,6 +193,296 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self)
 
     # ================================================================== layout
+    def _build_data_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        controls = QHBoxLayout()
+        self.data_mode = QComboBox()
+        self.data_mode.addItems(list(DATA_MODES))
+        self.data_mode.setAccessibleName("Digital mode")
+        mode_label = QLabel("Mode")
+        mode_label.setBuddy(self.data_mode)
+        controls.addWidget(mode_label)
+        controls.addWidget(self.data_mode)
+        self.data_sweetspot = QDoubleSpinBox(decimals=1, singleStep=25, suffix=" Hz")
+        self.data_sweetspot.setKeyboardTracking(False)
+        self.data_sweetspot.setAccessibleName("Digital signal audio center")
+        sweetspot_label = QLabel("Sweetspot")
+        sweetspot_label.setBuddy(self.data_sweetspot)
+        controls.addWidget(sweetspot_label)
+        controls.addWidget(self.data_sweetspot)
+        self.data_start = QPushButton("Start decoding")
+        self.data_start.clicked.connect(self._toggle_data)
+        controls.addWidget(self.data_start)
+        controls.addStretch()
+        layout.addLayout(controls)
+        source_row = QHBoxLayout()
+        self.data_source = QComboBox()
+        self.data_source.addItems(["Receiver audio", "Audio file"])
+        self.data_source.setAccessibleName("Decoder audio source")
+        self.data_file = QLineEdit(readOnly=True, placeholderText="Choose an audio recording…")
+        self.data_file.setAccessibleName("Audio recording path")
+        self.data_choose_file = QPushButton("Choose…")
+        self.data_choose_file.clicked.connect(self._choose_data_file)
+        source_row.addWidget(self.data_source)
+        source_row.addWidget(self.data_file, 1)
+        source_row.addWidget(self.data_choose_file)
+        layout.addLayout(source_row)
+        squelch_row = QHBoxLayout()
+        self.data_squelch = QCheckBox("Squelch", checked=True)
+        self.data_threshold = QSpinBox(minimum=0, maximum=100, value=20)
+        self.data_threshold.setKeyboardTracking(False)
+        self.data_threshold.setAccessibleName("Decoder squelch threshold")
+        squelch_row.addWidget(self.data_squelch)
+        squelch_row.addWidget(self.data_threshold)
+        squelch_row.addWidget(QLabel("Quality"))
+        self.data_quality = QProgressBar(minimum=0, maximum=100, value=0)
+        self.data_quality.setToolTip("Decoder quality, 0–100. Squelch suppresses text below the threshold.")
+        squelch_row.addWidget(self.data_quality, 1)
+        self.data_gate = QLabel("Closed")
+        squelch_row.addWidget(self.data_gate)
+        layout.addLayout(squelch_row)
+        hint = QLabel("Tune the radio on Radio, normally in USB or USB-D. Sweetspot is the "
+                      "signal's audio center in Hz. Auto needs an RSID announcement. The decoder "
+                      "receives audio before computer filters; radio NR, NB and notch can still affect it.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.data_status = QLabel("Decoding stopped")
+        self.data_status.setWordWrap(True)
+        layout.addWidget(self.data_status)
+        self.data_text = QPlainTextEdit(readOnly=True, maximumBlockCount=2000)
+        self.data_text.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.data_text.setAccessibleName("Decoded digital text")
+        self.data_text.setPlaceholderText("Decoded text will appear here.")
+        layout.addWidget(self.data_text, 1)
+        clear = QPushButton("Clear text")
+        clear.clicked.connect(self.data_text.clear)
+        layout.addWidget(clear, alignment=Qt.AlignRight)
+        self.data_mode.currentTextChanged.connect(self._data_mode_changed)
+        self.data_source.currentIndexChanged.connect(self._data_source_changed)
+        self.data_squelch.toggled.connect(self._data_squelch_changed)
+        self.data_threshold.valueChanged.connect(self._data_squelch_changed)
+        self._data_mode_changed()
+        self._data_source_changed()
+        return page
+
+    def _data_mode_changed(self, *_):
+        half = DATA_MODES[self.data_mode.currentText()] / 2
+        self.data_sweetspot.setRange(half + 1, 3000 - half - 1)
+        self.data_sweetspot.setEnabled(not self._data_active and self.data_mode.currentText() != "Auto (RSID)")
+
+    def _data_source_changed(self, *_):
+        file_input = self.data_source.currentIndex() == 1
+        self.data_file.setEnabled(file_input and not self._data_active)
+        self.data_choose_file.setEnabled(file_input and not self._data_active)
+
+    def _choose_data_file(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Choose audio to decode", self.data_file.text(),
+            "Audio recordings (*.wav *.m4a *.mp4 *.flac *.ogg *.mp3);;All files (*)")
+        if filename:
+            self.data_file.setText(filename)
+
+    def _data_squelch_changed(self, *_):
+        self.data_threshold.setEnabled(self.data_squelch.isChecked())
+        self.data_gate.setText("Open" if not self.data_squelch.isChecked()
+                              or self.data_quality.value() >= self.data_threshold.value() else "Closed")
+        self.service.set_data_squelch(self.data_squelch.isChecked(), self.data_threshold.value())
+
+    def _toggle_data(self):
+        try:
+            if self._data_active:
+                self.service.stop_data()
+            else:
+                self.service.start_data(
+                    self.data_mode.currentText(), self.data_sweetspot.value(),
+                    squelch=self.data_squelch.isChecked(), threshold=self.data_threshold.value(),
+                    source=self.data_file.text() if self.data_source.currentIndex() == 1 else None)
+        except (ValueError, RuntimeError, OSError) as error:
+            self.data_status.setText(str(error))
+
+    def _append_data_text(self, text):
+        cursor = self.data_text.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        for part in text.split("\b")[:-1]:
+            cursor.insertText(part)
+            cursor.deletePreviousChar()
+        cursor.insertText(text.rsplit("\b", 1)[-1])
+        # A transmission may contain no newline for hours.
+        excess = self.data_text.document().characterCount() - 200000
+        if excess > 0:
+            cursor.setPosition(0)
+            cursor.setPosition(excess, cursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+        self.data_text.moveCursor(cursor.MoveOperation.End)
+
+    def _build_flamp_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        hint = QLabel("Files received through Data appear here. Valid blocks are retained across "
+                      "repeats while the app is open, so later transmissions can fill missing blocks.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        folder_row = QHBoxLayout()
+        self.flamp_directory = QLineEdit()
+        self.flamp_directory.setAccessibleName("FLAMP receive folder")
+        self.flamp_directory.editingFinished.connect(self._configure_flamp)
+        choose = QPushButton("Choose folder…")
+        choose.clicked.connect(self._choose_flamp_folder)
+        folder_row.addWidget(self.flamp_directory, 1)
+        folder_row.addWidget(choose)
+        layout.addLayout(folder_row)
+        self.flamp_auto_save = QCheckBox("Automatically save completed files", checked=True)
+        self.flamp_auto_save.toggled.connect(self._configure_flamp)
+        layout.addWidget(self.flamp_auto_save)
+        self.flamp_table = QTableWidget(0, 5)
+        self.flamp_table.setHorizontalHeaderLabels(["File", "Blocks", "Missing", "Status", "ID"])
+        self.flamp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.flamp_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.flamp_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.flamp_table.verticalHeader().hide()
+        self.flamp_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.flamp_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.flamp_table.itemSelectionChanged.connect(self._flamp_selection_changed)
+        layout.addWidget(self.flamp_table, 1)
+        self.flamp_details = QLabel("No FLAMP transfers received")
+        self.flamp_details.setTextFormat(Qt.PlainText)
+        self.flamp_details.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.flamp_details.setWordWrap(True)
+        layout.addWidget(self.flamp_details)
+        self.flamp_status = QLabel("")
+        self.flamp_status.setTextFormat(Qt.PlainText)
+        self.flamp_status.setWordWrap(True)
+        layout.addWidget(self.flamp_status)
+        row = QHBoxLayout()
+        self.flamp_save = QPushButton("Save selected")
+        self.flamp_save.setEnabled(False)
+        self.flamp_save.clicked.connect(self._save_flamp)
+        self.flamp_clear = QPushButton("Clear selected transfer")
+        self.flamp_clear.setEnabled(False)
+        self.flamp_clear.clicked.connect(self._clear_flamp)
+        row.addWidget(self.flamp_save)
+        row.addWidget(self.flamp_clear)
+        row.addStretch()
+        layout.addLayout(row)
+        return page
+
+    def _configure_flamp(self, *_):
+        try:
+            self.service.configure_flamp(self.flamp_directory.text(), self.flamp_auto_save.isChecked())
+            return True
+        except (ValueError, RuntimeError) as error:
+            self.flamp_status.setText(str(error))
+            return False
+
+    def _choose_flamp_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "FLAMP receive folder", self.flamp_directory.text())
+        if folder:
+            self.flamp_directory.setText(folder)
+            self._configure_flamp()
+
+    def _selected_flamp(self):
+        row = self.flamp_table.currentRow()
+        return self._flamp_transfers[row] if 0 <= row < len(self._flamp_transfers) else None
+
+    def _flamp_selection_changed(self):
+        transfer = self._selected_flamp()
+        self.flamp_save.setEnabled(bool(transfer and transfer["ready"]))
+        self.flamp_clear.setEnabled(transfer is not None)
+        if transfer:
+            detail = "%s · %s" % (transfer["filename"], transfer["status"])
+            if transfer["sender"]:
+                detail += "\nFrom " + transfer["sender"]
+            if transfer["missing"]:
+                detail += "\nMissing blocks: " + transfer["missing"]
+            if transfer["path"]:
+                detail += "\n" + transfer["path"]
+            self.flamp_details.setText(detail)
+        else:
+            self.flamp_details.setText("No FLAMP transfer selected")
+
+    def _show_flamp_transfers(self, transfers):
+        previous = self._selected_flamp()
+        identifier = previous["id"] if previous else None
+        self._flamp_transfers = transfers
+        self.flamp_table.blockSignals(True)
+        self.flamp_table.setRowCount(len(transfers))
+        for row, transfer in enumerate(transfers):
+            total = "?" if transfer["total"] is None else str(transfer["total"])
+            values = [transfer["filename"], "%d / %s" % (transfer["received"], total),
+                      transfer["missing"], transfer["status"], transfer["id"]]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.flamp_table.setItem(row, column, item)
+            if transfer["id"] == identifier:
+                self.flamp_table.selectRow(row)
+        if transfers and self.flamp_table.currentRow() < 0:
+            self.flamp_table.selectRow(0)
+        self.flamp_table.blockSignals(False)
+        self._flamp_selection_changed()
+
+    def _save_flamp(self):
+        transfer = self._selected_flamp()
+        if transfer and self._configure_flamp():
+            self.service.save_flamp(transfer["id"])
+
+    def _clear_flamp(self):
+        transfer = self._selected_flamp()
+        if transfer:
+            self.service.clear_flamp(transfer["id"])
+
+    def _build_receive_filter_box(self):
+        box = QGroupBox("Computer receive audio filters")
+        layout = QGridLayout(box)
+        text = QLabel("Custom selects radio FIL1, then filters its received audio on this computer. "
+                      "Filters apply to playback, virtual cables, and recordings.")
+        text.setWordWrap(True)
+        layout.addWidget(text, 0, 0, 1, 3)
+        layout.addWidget(QLabel("Filter"), 1, 0)
+        layout.addWidget(QLabel("Center (Hz)"), 1, 1)
+        layout.addWidget(QLabel("Width (Hz)"), 1, 2)
+        self.receive_filter_inputs = {}
+        for row, (key, label, center, width) in enumerate((
+                ("bandpass", "Custom bandpass", 1500, 2400),
+                ("notch", "Manual audio notch", 1000, 50)), 2):
+            layout.addWidget(QLabel(label), row, 0)
+            for column, (part, default) in enumerate((("center", center), ("width", width)), 1):
+                name = key + "_" + part
+                control = QSpinBox(minimum=1, maximum=23999, value=default)
+                control.setAccessibleName(label + " " + part)
+                self.receive_filter_inputs[name] = control
+                layout.addWidget(control, row, column)
+        self.audio_notch_enabled = QCheckBox("Enable manual audio notch")
+        layout.addWidget(self.audio_notch_enabled, 4, 0, 1, 2)
+        apply = QPushButton("Apply audio filters")
+        apply.clicked.connect(lambda: self._apply_receive_filters())
+        layout.addWidget(apply, 4, 2)
+        self.receive_filter_status = QLabel("Custom bandpass is selected on the Radio tab.")
+        self.receive_filter_status.setWordWrap(True)
+        layout.addWidget(self.receive_filter_status, 5, 0, 1, 3)
+        return box
+
+    def _apply_receive_filters(self, custom=None):
+        if custom is None:
+            custom = self.radio.receive_dsp.custom
+        values = {name: control.value() for name, control in self.receive_filter_inputs.items()}
+        try:
+            self.service.configure_receive_dsp(
+                custom=custom, center=values["bandpass_center"], width=values["bandpass_width"],
+                notch=self.audio_notch_enabled.isChecked(),
+                notch_center=values["notch_center"], notch_width=values["notch_width"])
+        except (NotConnected, PttRefused, ValueError, RuntimeError) as exc:
+            self.receive_filter_status.setText(str(exc))
+            self.statusBar().showMessage(str(exc), 6000)
+            self._show_rig(self.radio.rig)
+            return
+        for name, value in values.items():
+            self.settings.setValue("audio_filter_" + name, value)
+        self.settings.setValue("audio_filter_notch", self.audio_notch_enabled.isChecked())
+        self.receive_filter_status.setText("Audio filters applied. Bandpass " + ("on." if custom else "off."))
+        self._show_rig(self.radio.rig)
+
     def _build_log_box(self):
         self.log_box = QGroupBox("Current session")
         layout = QVBoxLayout(self.log_box)
@@ -471,6 +773,9 @@ class MainWindow(QMainWindow):
             self.filter_group.addButton(b, n)
             self.filter_buttons[n] = b
             row.addWidget(b)
+        self.custom_filter_btn = QPushButton("Custom", checkable=True)
+        self.filter_group.addButton(self.custom_filter_btn, 4)
+        row.addWidget(self.custom_filter_btn)
         self.filter_group.idClicked.connect(self._filter_clicked)
         self.width_label = QLabel("")
         row.addWidget(self.width_label)
@@ -493,6 +798,16 @@ class MainWindow(QMainWindow):
         self.volume.sliderReleased.connect(self._volume_changed)
         self.volume_label = QLabel("100%")
         self.volume.valueChanged.connect(lambda v: self.volume_label.setText("%d%%" % v))
+        self.monitor_enable = QCheckBox("Also play to")
+        self.monitor_device = QComboBox()
+        self.monitor_device.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.monitor_volume = QSlider(Qt.Horizontal, minimum=0, maximum=200, value=100)
+        self.monitor_volume.setToolTip("Second output gain")
+        self.monitor_volume_label = QLabel("100%")
+        self.monitor_enable.toggled.connect(self._monitor_toggled)
+        self.monitor_device.currentIndexChanged.connect(self._monitor_device_changed)
+        self.monitor_volume.sliderReleased.connect(self._monitor_volume_changed)
+        self.monitor_volume.valueChanged.connect(lambda v: self.monitor_volume_label.setText("%d%%" % v))
         self.audio_stats = QLabel("")
         self.audio_stats.setStyleSheet("color: #526176")
         g.addWidget(self.audio_enable, 0, 0)
@@ -501,13 +816,18 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("Gain"), 1, 0)
         g.addWidget(self.volume, 1, 1)
         g.addWidget(self.volume_label, 1, 2)
-        g.addWidget(self.audio_stats, 2, 1, 1, 2)
+        g.addWidget(self.monitor_enable, 2, 0)
+        g.addWidget(self.monitor_device, 2, 1)
+        g.addWidget(QLabel("Gain"), 3, 0)
+        g.addWidget(self.monitor_volume, 3, 1)
+        g.addWidget(self.monitor_volume_label, 3, 2)
+        g.addWidget(self.audio_stats, 4, 1, 1, 2)
         if sys.platform.startswith("linux") and shutil.which("pactl"):
             mk = QPushButton("Create 'IcomRX' virtual sink")
             mk.setToolTip("pactl load-module module-null-sink sink_name=IcomRX\n"
                           "Other programs record from 'Monitor of IcomRX'.")
             mk.clicked.connect(self._create_pulse_sink)
-            g.addWidget(mk, 3, 1, 1, 2)
+            g.addWidget(mk, 5, 1, 1, 2)
         g.setColumnStretch(1, 1)
         return box
 
@@ -588,28 +908,30 @@ class MainWindow(QMainWindow):
         self.rf_power.sliderMoved.connect(lambda v: self.rf_power_label.setText("%d %%" % v))
         self.rf_power_label = QLabel("—")
         self.rf_power_label.setMinimumWidth(40)
-        self.tune_btn = QPushButton("TUNE")
-        self.tune_btn.setToolTip("Run the internal antenna tuner's tune cycle (like the radio's TUNER\n"
-                                 "button). Transmits a carrier; stopped after 30 s or on disconnect.")
+        self.tune_btn = QPushButton("TUNE", checkable=True)
+        self.tune_btn.setToolTip("Turn the antenna tuner on or off.")
         self.tune_btn.clicked.connect(self._tune_clicked)
         self.low_tune_btn = QPushButton("Low Power Tune")
         self.low_tune_btn.setEnabled(False)
-        self.low_tune_btn.setToolTip("Send a 1 kHz tone in USB-D or LSB-D at 5% power for up to 10 seconds.")
+        self.low_tune_btn.setToolTip("Send a 1 kHz tone at 5% power, start antenna tuning, and continue for 5 seconds.")
         self.low_tune_btn.clicked.connect(self._low_tune_clicked)
+        self.powered_tune_btn = QPushButton("Powered Tune")
+        self.powered_tune_btn.clicked.connect(lambda: self._low_tune_clicked(powered=True))
+        self.powered_tune_btn.setToolTip(
+            "Send a 1 kHz tone at the selected power, start antenna tuning, and continue for 5 seconds.")
         self.tuner_label = QLabel("Tuner: —")
         self.ptt_timeout = QSpinBox(minimum=10, maximum=600, value=180, suffix=" s")
         self.ptt_timeout.setToolTip("Transmit is cut off after this long, whatever keyed it")
         self.ptt_timeout.valueChanged.connect(lambda v: self.service.configure_transmit(timeout=v))
         # radio settings
         self.manage_data_mod = QCheckBox("DATA MOD → LAN")
-        self.manage_data_mod.setToolTip("Switch DATA MOD (data-mode audio source) to LAN while connected;\n"
-                                        "the original is saved and put back on disconnect")
-        self.manage_data_mod.toggled.connect(lambda on: self.service.configure_transmit(manage_data_mod=on))
+        self.manage_data_mod.setToolTip("Checked selects LAN for DATA-mode transmit audio.\n"
+                                        "Unchecking restores the saved source immediately, without disconnecting.")
+        self.manage_data_mod.toggled.connect(lambda on: self._mod_management_clicked("data_mod", on))
         self.manage_data_off_mod = QCheckBox("DATA OFF MOD → LAN")
-        self.manage_data_off_mod.setToolTip("Switch DATA OFF MOD (voice-mode audio source) to LAN while\n"
-                                            "connected; the original is saved and put back on disconnect.\n"
-                                            "While it is LAN, a microphone plugged into the radio is not used.")
-        self.manage_data_off_mod.toggled.connect(lambda on: self.service.configure_transmit(manage_data_off_mod=on))
+        self.manage_data_off_mod.setToolTip("Checked selects LAN for voice transmit audio.\n"
+                                            "Unchecking restores the saved source immediately, without disconnecting.")
+        self.manage_data_off_mod.toggled.connect(lambda on: self._mod_management_clicked("data_off_mod", on))
         self.data_mod_label = QLabel("")
         self.data_mod_label.setWordWrap(True)
         self.restore_btn = QPushButton("Restore now")
@@ -638,8 +960,8 @@ class MainWindow(QMainWindow):
         prow.addWidget(self.rf_power_label)
         prow.addSpacing(12)
         prow.addWidget(self.low_tune_btn)
+        prow.addWidget(self.powered_tune_btn)
         prow.addWidget(self.tune_btn)
-        prow.addWidget(self.tuner_label)
         g.addLayout(prow, 5, 0, 1, 5)
         self.txmeter_label = QLabel("Output —   SWR —")
         self.txmeter_label.setToolTip("Measured while transmitting or tuning; the last reading stays\n"
@@ -655,6 +977,8 @@ class MainWindow(QMainWindow):
         trow.addSpacing(16)
         trow.addWidget(self.txmeter_label)
         trow.addWidget(self.swr_dot)
+        trow.addSpacing(12)
+        trow.addWidget(self.tuner_label)
         trow.addStretch(1)
         g.addLayout(trow, 6, 0, 1, 5)
         if sys.platform.startswith("linux") and shutil.which("pactl"):
@@ -767,6 +1091,16 @@ class MainWindow(QMainWindow):
     # ================================================================== settings
     def _load_settings(self):
         s = self.settings
+        mode = s.value("data_mode", "MFSK32")
+        self.data_mode.setCurrentText(mode if mode in DATA_MODES else "MFSK32")
+        self.data_sweetspot.setValue(s.value("data_sweetspot_hz", 1500, type=float))
+        self.data_squelch.setChecked(s.value("data_squelch", True, type=bool))
+        self.data_threshold.setValue(s.value("data_threshold", 20, type=int))
+        default_flamp = str(Path(QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation))
+                            / "IcomRemote" / "Received")
+        self.flamp_directory.setText(s.value("flamp_directory", default_flamp))
+        self.flamp_auto_save.setChecked(s.value("flamp_auto_save", True, type=bool))
+        self._configure_flamp()
         self.host.setText(s.value("host", ""))
         self.user.setText(s.value("user", ""))
         remember = s.value("remember_pw", False, type=bool)
@@ -778,8 +1112,9 @@ class MainWindow(QMainWindow):
         idx = self.step.findData(s.value("step", 1000, type=int))
         self.step.setCurrentIndex(idx if idx >= 0 else 3)
         self._step_changed()
-        self._refresh_devices(select=s.value("audio_device", ""))
+        self._refresh_devices(select=s.value("audio_device", ""), monitor_select=s.value("monitor_device", ""))
         self.volume.setValue(s.value("volume", 100, type=int))
+        self.monitor_volume.setValue(s.value("monitor_volume", 100, type=int))
         i = self.rec_format.findData(s.value("rec_format", ".wav"))
         self.rec_format.setCurrentIndex(i if i >= 0 and self.rec_format.model().item(i).isEnabled() else 0)
         self.rec_dir.setText(s.value("rec_dir", default_record_dir()))
@@ -813,9 +1148,17 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geo)
         if s.value("audio_enable", False, type=bool) and self.device_combo.currentData():
             self.audio_enable.setChecked(True)
+        if s.value("monitor_enable", False, type=bool) and self.monitor_device.currentData():
+            self.monitor_enable.setChecked(True)
 
     def _save_settings(self):
         s = self.settings
+        s.setValue("data_mode", self.data_mode.currentText())
+        s.setValue("data_sweetspot_hz", self.data_sweetspot.value())
+        s.setValue("data_squelch", self.data_squelch.isChecked())
+        s.setValue("data_threshold", self.data_threshold.value())
+        s.setValue("flamp_directory", self.flamp_directory.text())
+        s.setValue("flamp_auto_save", self.flamp_auto_save.isChecked())
         s.setValue("host", self.host.text().strip())
         s.setValue("user", self.user.text().strip())
         s.setValue("remember_pw", self.remember_pw.isChecked())
@@ -827,6 +1170,9 @@ class MainWindow(QMainWindow):
         s.setValue("step", self.step.currentData())
         s.setValue("audio_device", self.device_combo.currentData() or "")
         s.setValue("audio_enable", self.audio_enable.isChecked())
+        s.setValue("monitor_device", self.monitor_device.currentData() or "")
+        s.setValue("monitor_enable", self.monitor_enable.isChecked())
+        s.setValue("monitor_volume", self.monitor_volume.value())
         s.setValue("volume", self.volume.value())
         s.setValue("rec_format", self.rec_format.currentData())
         s.setValue("rec_dir", self.rec_dir.text())
@@ -899,6 +1245,7 @@ class MainWindow(QMainWindow):
 
     def _set_controls_enabled(self, on):
         for w in (self.freq, self.data_btn, self.ptt_btn, self.voice_arm, self.rf_power, self.tune_btn,
+                  self.custom_filter_btn,
                   *self.mode_buttons.values(), *self.filter_buttons.values(), *self.quicktune_buttons):
             w.setEnabled(on)
         if not on:
@@ -907,8 +1254,8 @@ class MainWindow(QMainWindow):
             self.tune_btn.setEnabled(False)
             self.tune_btn.setToolTip("This radio has no antenna tuner command")
         self.low_tune_btn.setEnabled(on and self.radio.low_tune_supported)
-        self.manage_data_mod.setEnabled(not on)     # these take effect at connect time
-        self.manage_data_off_mod.setEnabled(not on)
+        self.powered_tune_btn.setEnabled(on and self.radio.low_tune_supported)
+        self._refresh_mod_controls()
 
     # ================================================================== tuning
     def _show_rig(self, st):
@@ -920,7 +1267,8 @@ class MainWindow(QMainWindow):
             b.setChecked(name == st.mode)
         self.data_btn.setChecked(st.data)
         for n, b in self.filter_buttons.items():
-            b.setChecked(n == st.filter)
+            b.setChecked(n == st.filter and not self.radio.receive_dsp.custom)
+        self.custom_filter_btn.setChecked(self.radio.receive_dsp.custom)
         w = st.width_hz
         self.width_label.setText(("%.1f kHz" % (w / 1000.0)) if w else "")
         if st.mode and st.mode not in BASE_MODES:
@@ -951,7 +1299,12 @@ class MainWindow(QMainWindow):
             self.data_btn.setChecked(not on)
 
     def _filter_clicked(self, n):
-        self._control(self.service.set_filter, n)
+        if n == 4:
+            self._apply_receive_filters(custom=True)
+        else:
+            self._apply_receive_filters(custom=False)
+            self._control(self.service.set_filter, n)
+        self._show_rig(self.radio.rig)
 
     def _check_quicktune(self):
         """(Re)load the quick-tune file when it appears, changes or goes away."""
@@ -989,7 +1342,7 @@ class MainWindow(QMainWindow):
             self._show_rig(self.radio.rig)
 
     # ================================================================== audio device
-    def _refresh_devices(self, select=None):
+    def _refresh_devices(self, select=None, monitor_select=None):
         current = select if isinstance(select, str) and select else self.device_combo.currentData()
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
@@ -1004,6 +1357,39 @@ class MainWindow(QMainWindow):
             idx = self.device_combo.findData(guess) if guess else 0
         self.device_combo.setCurrentIndex(max(idx, 0))
         self.device_combo.blockSignals(False)
+        current_monitor = monitor_select if isinstance(monitor_select, str) else self.monitor_device.currentData()
+        self.monitor_device.blockSignals(True)
+        self.monitor_device.clear()
+        self.monitor_device.addItem("Choose a second output…", None)
+        for key, label in devices:
+            self.monitor_device.addItem(label, key)
+        self.monitor_device.setCurrentIndex(max(0, self.monitor_device.findData(current_monitor)))
+        self.monitor_device.blockSignals(False)
+        if self.monitor_enable.isChecked():
+            self._monitor_toggled(True)
+
+    def _monitor_toggled(self, on):
+        key = self.monitor_device.currentData() if on else None
+        if on and not key:
+            self.monitor_enable.setChecked(False)
+            return
+        try:
+            self.service.set_audio_device(key, self.monitor_volume.value() / 100.0, output="monitor")
+        except Exception as error:
+            self.monitor_enable.blockSignals(True)
+            self.monitor_enable.setChecked(False)
+            self.monitor_enable.blockSignals(False)
+            self.service.set_audio_device(None, output="monitor")
+            QMessageBox.warning(self, "Second audio output", str(error))
+
+    def _monitor_device_changed(self, *_):
+        if self.monitor_enable.isChecked():
+            self._monitor_toggled(True)
+
+    def _monitor_volume_changed(self, *_):
+        sink = self.radio._sinks.get("monitor")
+        if sink is not None:
+            sink.gain = self.monitor_volume.value() / 100.0
 
     @Slot(bool)
     def _audio_toggled(self, on):
@@ -1018,6 +1404,7 @@ class MainWindow(QMainWindow):
             self.audio_enable.blockSignals(True)
             self.audio_enable.setChecked(False)
             self.audio_enable.blockSignals(False)
+            self.service.set_audio_device(None)
             self.audio_stats.setText("")
 
     def _create_pulse_sink(self, *_):
@@ -1113,17 +1500,11 @@ class MainWindow(QMainWindow):
         if on and not key:
             self.tx_enable.setChecked(False)
             return
-        if on and self.audio_enable.isChecked():
-            rx = (self.device_combo.currentData() or "").split("|")[0].lower()
-            tx = key.split("|")[0].lower()
-            if rx and (rx == tx or (rx.startswith("pulse-sink:") and tx == "pulse-source:%s.monitor" % rx[11:])):
-                QMessageBox.warning(self, "Transmit audio",
-                                    "Receive audio is played into the same device you selected for "
-                                    "transmit audio, so received audio would be transmitted.\n\n"
-                                    "Use a second virtual cable for transmit (see the README).")
-                self.tx_enable.setChecked(False)
-                return
-        self.service.set_tx_device(key, self.tx_gain.value() / 100.0)
+        try:
+            self.service.set_tx_device(key, self.tx_gain.value() / 100.0)
+        except ValueError as error:
+            QMessageBox.warning(self, "Transmit audio", str(error))
+            self.tx_enable.setChecked(False)
 
     def _tx_device_changed(self, *_):
         if self.tx_enable.isChecked():
@@ -1152,7 +1533,27 @@ class MainWindow(QMainWindow):
         except NotConnected as e:
             self.statusBar().showMessage(str(e), 5000)
 
+    def _refresh_mod_controls(self):
+        for setting, checkbox in (("data_mod", self.manage_data_mod),
+                                  ("data_off_mod", self.manage_data_off_mod)):
+            m = self.radio.mods[setting]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(m["manage"])
+            checkbox.blockSignals(False)
+            checkbox.setEnabled(not self.radio.connected or (
+                self.radio.power == "on" and self.radio._mods_ready is True
+                and m["item"] is not None and not self.radio.mod_change_active))
+
+    def _mod_management_clicked(self, setting, enabled):
+        option = "manage_" + setting
+        try:
+            self.service.configure_transmit(**{option: enabled})
+        except (NotConnected, PttRefused, ValueError, RuntimeError) as error:
+            self.statusBar().showMessage(str(error), 8000)
+        self._refresh_mod_controls()
+
     def _show_data_mod(self, info):
+        self._refresh_mod_controls()
         lines = []
         restorable = False
         for setting in ("data_mod", "data_off_mod"):
@@ -1190,17 +1591,20 @@ class MainWindow(QMainWindow):
         except (NotConnected, PttRefused) as e:
             self.statusBar().showMessage(str(e), 5000)
 
-    def _low_tune_clicked(self):
-        action = self.service.stop_low_tune if self.radio.low_tuning else self.service.start_low_tune
-        self._control(action)
+    def _low_tune_clicked(self, checked=False, powered=False):
+        if self.radio.low_tuning:
+            self._control(self.service.stop_low_tune)
+        else:
+            self._control(self.service.start_low_tune, powered)
 
     def _tune_clicked(self, *_):
         try:
-            self.service.start_tuner()
+            self.service.set_tuner_enabled(self.radio.tuner == civ.TUNER_OFF)
         except (NotConnected, PttRefused) as e:
             self.statusBar().showMessage(str(e), 8000)
 
     def _show_tuner(self, value):
+        self.tune_btn.setChecked(value in (civ.TUNER_ON, civ.TUNER_TUNING))
         self.tuner_label.setText("Tuner: " + {0: "off", 1: "on", 2: "tuning …"}.get(value, "?"))
 
     def _set_on_air(self, on):
@@ -1354,7 +1758,38 @@ class MainWindow(QMainWindow):
     # ================================================================== events (GUI thread)
     @Slot(str, object)
     def _on_event(self, kind, payload):
-        if kind == "dsp":
+        if kind == "flamp_transfers":
+            self._show_flamp_transfers(payload)
+        elif kind == "flamp_status":
+            self.flamp_status.setText(payload)
+        elif kind in ("data_state", "data_text", "data_quality"):
+            session = payload["session"]
+            if session < self._data_session:
+                return
+            self._data_session = session
+            if kind == "data_text":
+                self._append_data_text(payload["text"])
+            elif kind == "data_quality":
+                self.data_quality.setValue(round(payload["value"]))
+                self.data_gate.setText("Open" if not self.data_squelch.isChecked()
+                                      or self.data_quality.value() >= self.data_threshold.value() else "Closed")
+            else:
+                self._data_active = payload["active"]
+                if (self.data_mode.currentText() == "Auto (RSID)"
+                        and payload.get("state") == "receiving" and "sweetspot_hz" in payload):
+                    self.data_sweetspot.setValue(payload["sweetspot_hz"])
+                self.data_start.setText("Stop decoding" if self._data_active else "Start decoding")
+                self.data_mode.setEnabled(not self._data_active)
+                self._data_mode_changed()
+                self.data_source.setEnabled(not self._data_active)
+                self._data_source_changed()
+                if not self._data_active:
+                    self.data_quality.setValue(0)
+                    self.data_gate.setText("Closed" if self.data_squelch.isChecked() else "Open")
+                self.data_status.setText(payload["message"])
+        elif kind == "receive_filter":
+            self._show_rig(self.radio.rig)
+        elif kind == "dsp":
             self._dsp_state = payload
             if not payload:
                 for timer in self.dsp_timers.values():
@@ -1379,7 +1814,8 @@ class MainWindow(QMainWindow):
         elif kind == "tuner":
             self._show_tuner(payload)
         elif kind == "low_tune":
-            self.low_tune_btn.setText("Stop Low Power Tune" if payload else "Low Power Tune")
+            self.low_tune_btn.setText("Stop Tone" if payload else "Low Power Tune")
+            self.powered_tune_btn.setText("Stop Tone" if payload else "Powered Tune")
             self.rf_power.setEnabled(not payload and self.radio.power == "on")
         elif kind == "tuning":
             self.tune_btn.setEnabled(not payload and self.radio.connected)
@@ -1442,7 +1878,11 @@ class MainWindow(QMainWindow):
             if bool(payload.get("active")) == active and self.rec_btn.isChecked() != active:
                 self._show_recording(payload)
         elif kind == "sink_failed":
-            if payload == "card":
+            if payload == "monitor":
+                self.monitor_enable.blockSignals(True)
+                self.monitor_enable.setChecked(False)
+                self.monitor_enable.blockSignals(False)
+            elif payload == "card":
                 self.audio_enable.blockSignals(True)
                 self.audio_enable.setChecked(False)
                 self.audio_enable.blockSignals(False)
@@ -1482,6 +1922,7 @@ class MainWindow(QMainWindow):
         if self.log_box.isVisible():
             self._refresh_log()
         self._refresh_connection_state()
+        self._refresh_mod_controls()
         self._check_quicktune()
         if self.radio.recording_seconds() is not None and self._rec_started is not None:
             wall = time.monotonic() - self._rec_started
